@@ -1,0 +1,37 @@
+{
+  "name": "verity-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Verity healthcare API - Medicare coverage policies, prior auth, and medical codes",
+  "type": "module",
+  "bin": {
+    "verity-mcp": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js",
+    "dev": "tsc --watch"
+  },
+  "files": [
+    "build"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "healthcare",
+    "medicare",
+    "verity",
+    "coverage",
+    "prior-auth"
+  ],
+  "license": "MIT"
+}
