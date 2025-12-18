@@ -649,45 +649,36 @@ Example:
   }
 );
 
-// 8. check_prior_auth - Check prior authorization requirements
+// 8. check_prior_auth - Check Medicare prior authorization requirements
 server.registerTool(
   "check_prior_auth",
   {
     description: `Check if procedures require prior authorization for Medicare.
-Returns PA requirement, confidence level, matched policies, and documentation checklist.
-Essential for determining coverage requirements before procedures.
+Returns PA requirement, confidence level, matched LCD/NCD policies, and documentation checklist.
+Essential for determining Medicare coverage requirements before procedures.
 
 Examples:
 - check_prior_auth(["76942"]) - check PA for ultrasound guidance
-- check_prior_auth(["76942"], { state: "TX" }) - check for Texas patient
-- check_prior_auth(["J0585"], { diagnosis_codes: ["M62.81"] }) - with diagnosis context`,
+- check_prior_auth(["76942"], { state: "TX" }) - check for Texas patient (determines MAC jurisdiction)
+- check_prior_auth(["J0585", "64493"]) - check multiple procedure codes`,
     inputSchema: {
       procedure_codes: z
         .array(z.string())
         .min(1)
         .max(10)
         .describe("CPT/HCPCS codes to check (1-10 codes)"),
-      diagnosis_codes: z
-        .array(z.string())
-        .max(10)
-        .optional()
-        .describe("ICD-10 diagnosis codes for additional context"),
       state: z
         .string()
         .length(2)
         .optional()
         .describe("Two-letter state code to determine MAC jurisdiction (e.g., TX, CA)"),
-      payer: z
-        .enum(["medicare", "aetna", "uhc", "all"])
-        .default("medicare")
-        .describe("Payer to check"),
     },
   },
-  async ({ procedure_codes, diagnosis_codes, state, payer }) => {
+  async ({ procedure_codes, state }) => {
     try {
       const result = await verityRequest<any>("/prior-auth/check", {
         method: "POST",
-        body: { procedure_codes, diagnosis_codes, state, payer },
+        body: { procedure_codes, state },
       });
 
       return {
