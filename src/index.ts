@@ -25,12 +25,13 @@ const server = new McpServer({
 async function verityRequest<T>(
   endpoint: string,
   options: {
-    method?: "GET" | "POST";
+    method?: "GET" | "POST" | "PATCH" | "DELETE";
     params?: Record<string, string | number | boolean | undefined>;
     body?: unknown;
+    headers?: Record<string, string>;
   } = {}
 ): Promise<T> {
-  const { method = "GET", params, body } = options;
+  const { method = "GET", params, body, headers: extraHeaders } = options;
 
   // Build URL with query params
   const url = new URL(`${VERITY_API_BASE}${endpoint}`);
@@ -46,6 +47,7 @@ async function verityRequest<T>(
     Authorization: `Bearer ${VERITY_API_KEY}`,
     "Content-Type": "application/json",
     Accept: "application/json",
+    ...extraHeaders,
   };
 
   const response = await fetch(url.toString(), {
@@ -54,7 +56,8 @@ async function verityRequest<T>(
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  const data = await response.json();
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : { success: true, data: null };
 
   if (!response.ok) {
     const errorMsg = data.error?.message || `API error: ${response.status}`;
@@ -223,6 +226,64 @@ function formatPriorAuth(result: any): string {
     }
   }
 
+  return lines.join("\n");
+}
+
+function formatJson(value: unknown): string {
+  return JSON.stringify(value, null, 2);
+}
+
+function formatClaimValidation(result: any): string {
+  const lines: string[] = [];
+  lines.push(`Coverage Status: ${result.coverage_status}`);
+  lines.push(`Prior Auth Required: ${result.prior_auth_required ? "YES" : "NO"}`);
+  lines.push(`Denial Risk: ${result.denial_risk}`);
+  lines.push(`Overall Risk: ${result.overall_risk}`);
+  lines.push(`Confidence: ${result.confidence}`);
+
+  if (result.documentation_requirements?.length > 0) {
+    lines.push("\n--- Documentation Requirements ---");
+    result.documentation_requirements.forEach((item: string) => lines.push(`- ${item}`));
+  }
+
+  if (result.known_gaps?.length > 0) {
+    lines.push("\n--- Known Gaps ---");
+    result.known_gaps.forEach((item: string) => lines.push(`- ${item}`));
+  }
+
+  if (result.codes?.length > 0) {
+    lines.push("\n--- Code-Level Results ---");
+    result.codes.forEach((code: any) => {
+      lines.push(`${code.code}: ${code.coverage_status}, PA: ${code.prior_auth_required ? "yes" : "no"}, risk: ${code.denial_risk}`);
+      if (code.issues?.length) lines.push(`  Issues: ${code.issues.join("; ")}`);
+    });
+  }
+
+  return lines.join("\n");
+}
+
+function formatResearch(result: any): string {
+  const lines: string[] = [];
+  lines.push(`Research ID: ${result.research_id}`);
+  lines.push(`Status: ${result.status}`);
+  if (result.created_at) lines.push(`Created: ${result.created_at}`);
+  if (result.finished_at) lines.push(`Finished: ${result.finished_at}`);
+  if (result.poll_url) lines.push(`Poll URL: ${result.poll_url}`);
+
+  if (result.result?.determination) {
+    const determination = result.result.determination;
+    lines.push("\n--- Determination ---");
+    lines.push(`PA Required: ${determination.pa_required ? "YES" : "NO"}`);
+    lines.push(`Confidence: ${determination.confidence}`);
+    if (determination.reasoning) lines.push(`Reasoning: ${determination.reasoning}`);
+  }
+
+  if (result.result?.documentation_requirements?.length) {
+    lines.push("\n--- Documentation Requirements ---");
+    result.result.documentation_requirements.forEach((item: string) => lines.push(`- ${item}`));
+  }
+
+  if (result.error) lines.push(`\nError: ${result.error}`);
   return lines.join("\n");
 }
 
@@ -688,6 +749,368 @@ Examples:
       return {
         content: [{ type: "text", text: `Error checking prior auth: ${error instanceof Error ? error.message : String(error)}` }],
       };
+    }
+  }
+);
+
+// 9. get_health - API health check
+server.registerTool(
+  "get_health",
+  {
+    description: "Check Verity API health and dependency status.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const result = await verityRequest<any>("/health");
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error checking health: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 10. get_spending_by_code - Medicaid spending data
+server.registerTool(
+  "get_spending_by_code",
+  {
+    description: "Get Medicaid provider spending statistics for one or more HCPCS codes.",
+    inputSchema: {
+      code: z.string().optional().describe("Single HCPCS code"),
+      codes: z.array(z.string()).max(10).optional().describe("Multiple HCPCS codes"),
+      year: z.number().int().optional().describe("Optional year filter"),
+    },
+  },
+  async ({ code, codes, year }) => {
+    try {
+      const result = await verityRequest<any>("/spending/by-code", {
+        params: { code, codes: codes?.join(","), year },
+      });
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting spending data: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 11. validate_claim - Claim coverage and denial risk
+server.registerTool(
+  "validate_claim",
+  {
+    description: "Validate coverage, prior-auth requirement, documentation requirements, and denial risk for CPT/HCPCS procedure codes.",
+    inputSchema: {
+      procedure_codes: z.array(z.string()).min(1).max(10).describe("CPT/HCPCS procedure codes"),
+      payer: z.string().optional().describe("Payer or policy source label"),
+      plan_type: z.enum(["commercial", "medicare_advantage", "medicaid", "traditional_medicare", "exchange"]).optional(),
+      line_of_business: z.string().optional(),
+      diagnosis_codes: z.array(z.string()).max(20).optional(),
+      modifiers: z.array(z.string()).max(5).optional(),
+      state: z.string().length(2).optional(),
+      site_of_service: z.enum(["office", "outpatient_hospital", "asc", "inpatient", "home", "telehealth"]).optional(),
+      provider_specialty: z.string().optional(),
+      age_category: z.enum(["pediatric", "adult", "medicare_age"]).optional(),
+      sex_when_policy_relevant: z.enum(["female", "male", "other", "unknown"]).optional(),
+      idempotency_key: z.string().optional(),
+      legacy: z.boolean().default(false).describe("Use deprecated /claim-validation endpoint"),
+    },
+  },
+  async ({ idempotency_key, legacy, ...body }) => {
+    try {
+      const result = await verityRequest<any>(legacy ? "/claim-validation" : "/claims/validate", {
+        method: "POST",
+        body,
+        headers: idempotency_key ? { "X-Idempotency-Key": idempotency_key } : undefined,
+      });
+      return { content: [{ type: "text", text: formatClaimValidation(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error validating claim: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 12. research_prior_auth - AI web research
+server.registerTool(
+  "research_prior_auth",
+  {
+    description: "Research prior authorization requirements directly from payer websites. Supports async mode or sync completion.",
+    inputSchema: {
+      procedure_codes: z.array(z.string()).min(1).max(10),
+      payer: z.string().optional(),
+      state: z.string().length(2).optional(),
+      diagnosis_codes: z.array(z.string()).optional(),
+      clinical_context: z.string().max(2000).optional(),
+      sync: z.boolean().default(false),
+    },
+  },
+  async (body) => {
+    try {
+      const result = await verityRequest<any>("/prior-auth/research", { method: "POST", body });
+      return { content: [{ type: "text", text: formatResearch(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error researching prior auth: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 13. get_prior_auth_research - Poll research task
+server.registerTool(
+  "get_prior_auth_research",
+  {
+    description: "Get status and results for a prior authorization research task.",
+    inputSchema: {
+      research_id: z.string().min(1),
+    },
+  },
+  async ({ research_id }) => {
+    try {
+      const result = await verityRequest<any>(`/prior-auth/research/${encodeURIComponent(research_id)}`);
+      return { content: [{ type: "text", text: formatResearch(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting research status: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 14. batch_lookup_codes - Batch medical code lookup
+server.registerTool(
+  "batch_lookup_codes",
+  {
+    description: "Look up multiple medical codes in one request. Individual misses return found=false instead of failing the whole batch.",
+    inputSchema: {
+      codes: z.array(z.string()).min(1).max(50),
+      code_system: z.enum(["CPT", "HCPCS", "ICD10CM", "ICD10PCS", "NDC"]).optional(),
+      include: z.string().optional().describe("Comma-separated includes, e.g. rvu,policies"),
+    },
+  },
+  async (body) => {
+    try {
+      const result = await verityRequest<any>("/codes/batch", { method: "POST", body });
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error batch looking up codes: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 15. evaluate_coverage - Evaluate policy criteria
+server.registerTool(
+  "evaluate_coverage",
+  {
+    description: "Evaluate a policy's coverage criteria against patient or claim parameters.",
+    inputSchema: {
+      policy_id: z.string().min(1),
+      parameters: z.record(z.unknown()),
+    },
+  },
+  async (body) => {
+    try {
+      const result = await verityRequest<any>("/coverage/evaluate", { method: "POST", body });
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error evaluating coverage: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 16. list_webhooks - Enterprise webhook endpoints
+server.registerTool(
+  "list_webhooks",
+  {
+    description: "List webhook endpoints for the authenticated organization.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const result = await verityRequest<any>("/webhooks");
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error listing webhooks: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 17. create_webhook - Create webhook endpoint
+server.registerTool(
+  "create_webhook",
+  {
+    description: "Create a webhook endpoint. Returns the webhook secret once.",
+    inputSchema: {
+      url: z.string().url(),
+      events: z.array(z.string()).min(1),
+    },
+  },
+  async (body) => {
+    try {
+      const result = await verityRequest<any>("/webhooks", { method: "POST", body });
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error creating webhook: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 18. update_webhook - Update webhook endpoint
+server.registerTool(
+  "update_webhook",
+  {
+    description: "Update a webhook endpoint URL, events, or status.",
+    inputSchema: {
+      id: z.number().int(),
+      url: z.string().url().optional(),
+      events: z.array(z.string()).optional(),
+      status: z.string().optional(),
+    },
+  },
+  async ({ id, url, events, status }) => {
+    try {
+      const result = await verityRequest<any>(`/webhooks/${id}`, {
+        method: "PATCH",
+        body: { url, events, status },
+      });
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error updating webhook: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 19. delete_webhook - Delete webhook endpoint
+server.registerTool(
+  "delete_webhook",
+  {
+    description: "Delete a webhook endpoint.",
+    inputSchema: {
+      id: z.number().int(),
+    },
+  },
+  async ({ id }) => {
+    try {
+      const result = await verityRequest<any>(`/webhooks/${id}`, { method: "DELETE" });
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error deleting webhook: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 20. test_webhook - Send test webhook event
+server.registerTool(
+  "test_webhook",
+  {
+    description: "Send a test event to a webhook endpoint.",
+    inputSchema: {
+      id: z.number().int(),
+    },
+  },
+  async ({ id }) => {
+    try {
+      const result = await verityRequest<any>(`/webhooks/${id}/test`, { method: "POST" });
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error testing webhook: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 21. list_unreviewed_changes - Compliance changes
+server.registerTool(
+  "list_unreviewed_changes",
+  {
+    description: "List policy changes not yet acknowledged by the authenticated organization.",
+    inputSchema: {
+      change_type: z.string().optional(),
+      cursor: z.string().optional(),
+      limit: z.number().int().min(1).max(100).default(50),
+    },
+  },
+  async ({ change_type, cursor, limit }) => {
+    try {
+      const result = await verityRequest<any>("/compliance/unreviewed", {
+        params: { change_type, cursor, limit },
+      });
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error listing unreviewed changes: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 22. acknowledge_change - Acknowledge one compliance change
+server.registerTool(
+  "acknowledge_change",
+  {
+    description: "Acknowledge a single policy change.",
+    inputSchema: {
+      diff_id: z.number().int(),
+      notes: z.string().max(500).optional(),
+    },
+  },
+  async (body) => {
+    try {
+      const result = await verityRequest<any>("/compliance/ack", { method: "POST", body });
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error acknowledging change: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 23. bulk_acknowledge_changes - Acknowledge many compliance changes
+server.registerTool(
+  "bulk_acknowledge_changes",
+  {
+    description: "Acknowledge multiple policy changes.",
+    inputSchema: {
+      diff_ids: z.array(z.number().int()).min(1).max(200),
+      notes: z.string().max(500).optional(),
+    },
+  },
+  async (body) => {
+    try {
+      const result = await verityRequest<any>("/compliance/ack/bulk", { method: "POST", body });
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error bulk acknowledging changes: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 24. get_compliance_stats - Compliance dashboard stats
+server.registerTool(
+  "get_compliance_stats",
+  {
+    description: "Get compliance dashboard statistics for the authenticated organization.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const result = await verityRequest<any>("/compliance/stats");
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error getting compliance stats: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+  }
+);
+
+// 25. search_drug_formulary_evidence - Drug formulary evidence
+server.registerTool(
+  "search_drug_formulary_evidence",
+  {
+    description: "Search commercial pharmacy-benefit evidence from CVS Caremark, Express Scripts, and UnitedHealthcare / Optum Rx.",
+    inputSchema: {
+      query: z.string().min(2).max(200),
+      payer: z.enum(["all", "cvs_caremark", "express_scripts", "uhc"]).default("all"),
+      limit: z.number().int().min(1).max(100).default(25),
+    },
+  },
+  async ({ query, payer, limit }) => {
+    try {
+      const result = await verityRequest<any>("/drugs/formulary", {
+        params: { q: query, payer, limit },
+      });
+      return { content: [{ type: "text", text: formatJson(result.data) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error searching drug formulary: ${error instanceof Error ? error.message : String(error)}` }] };
     }
   }
 );
