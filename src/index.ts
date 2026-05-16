@@ -783,6 +783,17 @@ server.registerTool(
   },
   async ({ code, codes, year }) => {
     try {
+      if ((code && codes?.length) || (!code && !codes?.length)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error getting spending data: provide exactly one of code or codes.",
+            },
+          ],
+        };
+      }
+
       const result = await verityRequest<any>("/spending/by-code", {
         params: { code, codes: codes?.join(","), year },
       });
@@ -935,7 +946,7 @@ server.registerTool(
   {
     description: "Create a webhook endpoint. Returns the webhook secret once.",
     inputSchema: {
-      url: z.string().url(),
+      url: z.string().url().refine((value) => new URL(value).protocol === "https:", "Webhook URL must use HTTPS"),
       events: z.array(z.string()).min(1),
     },
   },
@@ -956,9 +967,9 @@ server.registerTool(
     description: "Update a webhook endpoint URL, events, or status.",
     inputSchema: {
       id: z.number().int(),
-      url: z.string().url().optional(),
+      url: z.string().url().refine((value) => new URL(value).protocol === "https:", "Webhook URL must use HTTPS").optional(),
       events: z.array(z.string()).optional(),
-      status: z.string().optional(),
+      status: z.enum(["active", "paused"]).optional(),
     },
   },
   async ({ id, url, events, status }) => {
@@ -1028,7 +1039,7 @@ server.registerTool(
       const result = await verityRequest<any>("/compliance/unreviewed", {
         params: { change_type, cursor, limit },
       });
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      return { content: [{ type: "text", text: formatJson({ data: result.data, meta: result.meta }) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error listing unreviewed changes: ${error instanceof Error ? error.message : String(error)}` }] };
     }
