@@ -142,6 +142,81 @@ check_prior_auth(["76942"], { state: "TX" })
 check_prior_auth(["J0585"], { diagnosis_codes: ["M62.81"] })
 ```
 
+### 9. `get_health`
+Check API health and dependency status.
+
+```
+get_health()
+```
+
+### 10. `get_spending_by_code`
+Get Medicaid spending data by HCPCS code.
+
+```
+get_spending_by_code({ code: "T1019" })
+get_spending_by_code({ codes: ["T1019", "T1020"], year: 2023 })
+```
+
+### 11. `validate_claim`
+Validate claim coverage and denial risk.
+
+```
+validate_claim({ procedure_codes: ["99213"], diagnosis_codes: ["E11.9"], payer: "Medicare", state: "TX" })
+```
+
+### 12. `research_prior_auth`
+Research prior authorization requirements from payer websites.
+
+```
+research_prior_auth({ procedure_codes: ["27447"], payer: "UnitedHealthcare", state: "TX", sync: true })
+```
+
+### 13. `get_prior_auth_research`
+Poll a prior authorization research task.
+
+```
+get_prior_auth_research({ research_id: "res_abc123" })
+```
+
+### 14. `batch_lookup_codes`
+Look up multiple medical codes in one request.
+
+```
+batch_lookup_codes({ codes: ["76942", "99213"], include: "rvu,policies" })
+```
+
+### 15. `evaluate_coverage`
+Evaluate policy criteria against structured parameters.
+
+```
+evaluate_coverage({ policy_id: "L33831", parameters: { diagnosis_codes: ["M54.5"] } })
+```
+
+### 16-20. Webhooks
+List, create, update, delete, and test webhook endpoints.
+
+```
+list_webhooks()
+create_webhook({ url: "https://example.com/webhooks/verity", events: ["policy.changed"] })
+test_webhook({ id: 123 })
+```
+
+### 21-24. Compliance
+List and acknowledge unreviewed policy changes.
+
+```
+list_unreviewed_changes({ limit: 10 })
+get_compliance_stats()
+acknowledge_change({ diff_id: 123, notes: "Reviewed" })
+```
+
+### 25. `search_drug_formulary_evidence`
+Search commercial pharmacy-benefit formulary evidence.
+
+```
+search_drug_formulary_evidence({ query: "ozempic", payer: "all", limit: 5 })
+```
+
 ## Environment Variables
 
 | Variable | Required | Description |
