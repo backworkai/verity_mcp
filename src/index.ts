@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { realpathSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -18,15 +20,10 @@ const httpPath = normalizePath(readOption("path") || process.env.VERITY_MCP_PATH
 const httpHost = readOption("host") || process.env.VERITY_MCP_HOST || "127.0.0.1";
 const httpPort = Number(readOption("port") || process.env.VERITY_MCP_PORT || process.env.PORT || "3000");
 const allowEnvKeyForHttp = args.includes("--allow-env-key") || process.env.VERITY_MCP_ALLOW_ENV_KEY === "true";
-const allowedOrigins = parseAllowedOrigins(process.env.VERITY_MCP_ALLOWED_ORIGINS || process.env.VERITY_MCP_ALLOW_ORIGIN);
+const allowedOrigins = parseAllowedList(process.env.VERITY_MCP_ALLOWED_ORIGINS || process.env.VERITY_MCP_ALLOW_ORIGIN);
+const allowedHosts = parseAllowedList(process.env.VERITY_MCP_ALLOWED_HOSTS || process.env.VERITY_MCP_ALLOW_HOST);
 
 type AuthenticatedIncomingMessage = IncomingMessage & { auth?: AuthInfo };
-
-// Create server instance
-const server = new McpServer({
-  name: "verity",
-  version: "1.0.0",
-});
 
 function readOption(name: string): string | undefined {
   const prefix = `--${name}=`;
@@ -70,14 +67,24 @@ function resolveVerityApiKey(): string {
   return apiKey;
 }
 
-function parseAllowedOrigins(value: string | undefined): Set<string> {
+function parseAllowedList(value: string | undefined): Set<string> {
   if (!value) return new Set();
   return new Set(
     value
       .split(",")
-      .map((origin) => origin.trim())
+      .map((origin) => origin.trim().toLowerCase())
       .filter(Boolean)
   );
+}
+
+function normalizeHost(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const host = value.trim().toLowerCase();
+  if (!host) return undefined;
+  if (host.startsWith("[")) {
+    return host.slice(1, host.indexOf("]"));
+  }
+  return host.split(":")[0];
 }
 
 function isLoopbackHost(host: string): boolean {
@@ -93,16 +100,34 @@ function isPrivateHost(host: string): boolean {
   );
 }
 
+function isAllowedHost(req: IncomingMessage): boolean {
+  const requestHost = normalizeHost(req.headers.host);
+  if (!requestHost) return false;
+
+  if (allowedHosts.has(requestHost)) return true;
+
+  const vercelUrlHost = normalizeHost(process.env.VERCEL_URL);
+  if (vercelUrlHost && requestHost === vercelUrlHost) return true;
+
+  const publicHost = normalizeHost(process.env.VERITY_MCP_PUBLIC_HOST);
+  if (publicHost && requestHost === publicHost) return true;
+
+  const configuredHost = normalizeHost(httpHost);
+  if (configuredHost && configuredHost !== "0.0.0.0" && requestHost === configuredHost) return true;
+
+  return isPrivateHost(requestHost) && (!configuredHost || configuredHost === "0.0.0.0" || isPrivateHost(configuredHost));
+}
+
 function isAllowedOrigin(req: IncomingMessage): boolean {
   const origin = req.headers.origin;
   if (!origin) return true;
 
-  if (allowedOrigins.has(origin)) return true;
+  if (allowedOrigins.has(origin.toLowerCase())) return true;
 
   try {
     const parsed = new URL(origin);
-    const requestHost = (req.headers.host || "").split(":")[0];
-    return isLoopbackHost(parsed.hostname) && isLoopbackHost(requestHost);
+    const requestHost = normalizeHost(req.headers.host);
+    return isLoopbackHost(parsed.hostname.toLowerCase()) && Boolean(requestHost && isLoopbackHost(requestHost));
   } catch {
     return false;
   }
@@ -396,6 +421,12 @@ function formatResearch(result: any): string {
   if (result.error) lines.push(`\nError: ${result.error}`);
   return lines.join("\n");
 }
+
+function createVerityMcpServer(): McpServer {
+const server = new McpServer({
+  name: "verity",
+  version: "1.0.0",
+});
 
 // Register tools
 
@@ -1245,6 +1276,9 @@ server.registerTool(
   }
 );
 
+return server;
+}
+
 function setHttpHeaders(req: IncomingMessage, res: ServerResponse): void {
   res.setHeader("Access-Control-Allow-Origin", responseOrigin(req));
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
@@ -1272,8 +1306,206 @@ function resolveHttpApiKey(req: IncomingMessage): string | undefined {
   if (bearerToken) return bearerToken;
   if (!allowEnvKeyForHttp || !process.env.VERITY_API_KEY) return undefined;
 
-  const requestHost = (req.headers.host || "").split(":")[0];
-  return isPrivateHost(httpHost) && isPrivateHost(requestHost) ? process.env.VERITY_API_KEY : undefined;
+  const requestHost = normalizeHost(req.headers.host);
+  return requestHost && isPrivateHost(httpHost) && isPrivateHost(requestHost) ? process.env.VERITY_API_KEY : undefined;
+}
+
+async function readRequestBody(req: IncomingMessage): Promise<unknown> {
+  const requestWithBody = req as IncomingMessage & { body?: unknown };
+  const contentType = Array.isArray(req.headers["content-type"]) ? req.headers["content-type"].join(",") : req.headers["content-type"] || "";
+  if (requestWithBody.body !== undefined) {
+    if (typeof requestWithBody.body === "string" && contentType.toLowerCase().includes("application/json")) {
+      return JSON.parse(requestWithBody.body);
+    }
+    return requestWithBody.body;
+  }
+  if (req.method !== "POST") return undefined;
+
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  const rawBody = Buffer.concat(chunks).toString("utf8");
+  if (!rawBody.trim()) return undefined;
+
+  if (!contentType.toLowerCase().includes("application/json")) return rawBody;
+
+  return JSON.parse(rawBody);
+}
+
+function isInvalidJsonError(error: unknown): boolean {
+  return error instanceof SyntaxError || (error instanceof Error && error.message.toLowerCase().includes("invalid json"));
+}
+
+function rejectUnsafeHttpRequest(req: IncomingMessage, res: ServerResponse): boolean {
+  setHttpHeaders(req, res);
+
+  if (req.method === "OPTIONS") {
+    if (!isAllowedHost(req)) {
+      sendJson(req, res, 421, {
+        error: "host_not_allowed",
+        message: "Configure VERITY_MCP_ALLOWED_HOSTS or VERITY_MCP_PUBLIC_HOST to allow this Host.",
+      });
+      return true;
+    }
+
+    if (!isAllowedOrigin(req)) {
+      sendJson(req, res, 403, {
+        error: "origin_not_allowed",
+        message: "Configure VERITY_MCP_ALLOWED_ORIGINS to allow this Origin.",
+      });
+      return true;
+    }
+
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+
+  if (!isAllowedHost(req)) {
+    sendJson(req, res, 421, {
+      error: "host_not_allowed",
+      message: "Configure VERITY_MCP_ALLOWED_HOSTS or VERITY_MCP_PUBLIC_HOST to allow this Host.",
+    });
+    return true;
+  }
+
+  if (!isAllowedOrigin(req)) {
+    sendJson(req, res, 403, {
+      error: "origin_not_allowed",
+      message: "Configure VERITY_MCP_ALLOWED_ORIGINS to allow this Origin.",
+    });
+    return true;
+  }
+
+  return false;
+}
+
+export function handleHealthRequest(req: IncomingMessage, res: ServerResponse): void {
+  if (rejectUnsafeHttpRequest(req, res)) return;
+
+  if (req.method !== "GET") {
+    sendJson(req, res, 405, {
+      error: "method_not_allowed",
+      message: "Use GET for the health endpoint.",
+    });
+    return;
+  }
+
+  sendJson(req, res, 200, {
+    status: "ok",
+    transport: "streamable-http",
+    mcp_path: httpPath,
+  });
+}
+
+export function handleRootRequest(req: IncomingMessage, res: ServerResponse): void {
+  if (rejectUnsafeHttpRequest(req, res)) return;
+
+  if (req.method !== "GET") {
+    sendJson(req, res, 405, {
+      error: "method_not_allowed",
+      message: "Use GET for this endpoint.",
+    });
+    return;
+  }
+
+  sendJson(req, res, 200, {
+    name: "verity-mcp",
+    transport: "streamable-http",
+    mcp_url: httpPath,
+    authentication: "Send Authorization: Bearer <VERITY_API_KEY> with each MCP request.",
+  });
+}
+
+export async function handleMcpEndpointRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (rejectUnsafeHttpRequest(req, res)) return;
+
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST, OPTIONS");
+    sendJson(req, res, 405, {
+      error: "method_not_allowed",
+      message: "Use POST for stateless Streamable HTTP MCP requests.",
+    });
+    return;
+  }
+
+  const apiKey = resolveHttpApiKey(req);
+  if (!apiKey) {
+    res.setHeader("WWW-Authenticate", 'Bearer realm="Verity MCP", error="invalid_token"');
+    sendJson(req, res, 401, {
+      error: "missing_bearer_token",
+      message: "Send Authorization: Bearer <VERITY_API_KEY> with the MCP request.",
+    });
+    return;
+  }
+
+  const authenticatedReq = req as AuthenticatedIncomingMessage;
+  authenticatedReq.auth = {
+    token: apiKey,
+    clientId: "verity-api-key",
+    scopes: [],
+  };
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
+
+  res.on("close", () => {
+    void transport.close();
+  });
+
+  try {
+    const body = await readRequestBody(authenticatedReq);
+    const server = createVerityMcpServer();
+    await server.connect(transport);
+    await requestApiKey.run(apiKey, () => transport.handleRequest(authenticatedReq, res, body));
+  } catch (error) {
+    if (!isInvalidJsonError(error)) {
+      console.error("Error handling MCP HTTP request:", error);
+    }
+    if (!res.headersSent) {
+      if (isInvalidJsonError(error)) {
+        sendJson(req, res, 400, {
+          error: "invalid_json",
+          message: "MCP request body must be valid JSON.",
+        });
+      } else {
+        sendJson(req, res, 500, {
+          error: "mcp_request_failed",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    } else {
+      res.end();
+    }
+  }
+}
+
+export async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+  if (url.pathname === "/health") {
+    handleHealthRequest(req, res);
+    return;
+  }
+
+  if (url.pathname === "/") {
+    handleRootRequest(req, res);
+    return;
+  }
+
+  if (url.pathname !== httpPath) {
+    if (rejectUnsafeHttpRequest(req, res)) return;
+    sendJson(req, res, 404, {
+      error: "not_found",
+      message: `Use ${httpPath} for MCP Streamable HTTP requests.`,
+    });
+    return;
+  }
+
+  await handleMcpEndpointRequest(req, res);
 }
 
 async function startStdioServer(): Promise<void> {
@@ -1283,6 +1515,7 @@ async function startStdioServer(): Promise<void> {
     process.exit(1);
   }
 
+  const server = createVerityMcpServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Verity MCP Server running on stdio");
@@ -1293,99 +1526,7 @@ async function startHttpServer(): Promise<void> {
     throw new Error(`Invalid HTTP port: ${httpPort}`);
   }
 
-  const httpServer = createServer(async (req, res) => {
-    setHttpHeaders(req, res);
-
-    if (req.method === "OPTIONS") {
-      if (!isAllowedOrigin(req)) {
-        sendJson(req, res, 403, {
-          error: "origin_not_allowed",
-          message: "Configure VERITY_MCP_ALLOWED_ORIGINS to allow this Origin.",
-        });
-        return;
-      }
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-
-    if (!isAllowedOrigin(req)) {
-      sendJson(req, res, 403, {
-        error: "origin_not_allowed",
-        message: "Configure VERITY_MCP_ALLOWED_ORIGINS to allow this Origin.",
-      });
-      return;
-    }
-
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-
-    if (req.method === "GET" && url.pathname === "/health") {
-      sendJson(req, res, 200, {
-        status: "ok",
-        transport: "streamable-http",
-        mcp_path: httpPath,
-      });
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/") {
-      sendJson(req, res, 200, {
-        name: "verity-mcp",
-        transport: "streamable-http",
-        mcp_url: httpPath,
-        authentication: "Send Authorization: Bearer <VERITY_API_KEY> with each MCP request.",
-      });
-      return;
-    }
-
-    if (url.pathname !== httpPath) {
-      sendJson(req, res, 404, {
-        error: "not_found",
-        message: `Use ${httpPath} for MCP Streamable HTTP requests.`,
-      });
-      return;
-    }
-
-    const apiKey = resolveHttpApiKey(req);
-    if (!apiKey) {
-      res.setHeader("WWW-Authenticate", 'Bearer realm="Verity MCP", error="invalid_token"');
-      sendJson(req, res, 401, {
-        error: "missing_bearer_token",
-        message: "Send Authorization: Bearer <VERITY_API_KEY> with the MCP request.",
-      });
-      return;
-    }
-
-    const authenticatedReq = req as AuthenticatedIncomingMessage;
-    authenticatedReq.auth = {
-      token: apiKey,
-      clientId: "verity-api-key",
-      scopes: [],
-    };
-
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
-
-    res.on("close", () => {
-      void transport.close();
-    });
-
-    try {
-      await server.connect(transport);
-      await requestApiKey.run(apiKey, () => transport.handleRequest(authenticatedReq, res));
-    } catch (error) {
-      console.error("Error handling MCP HTTP request:", error);
-      if (!res.headersSent) {
-        sendJson(req, res, 500, {
-          error: "mcp_request_failed",
-          message: error instanceof Error ? error.message : String(error),
-        });
-      } else {
-        res.end();
-      }
-    }
-  });
+  const httpServer = createServer(handleHttpRequest);
 
   httpServer.listen(httpPort, httpHost, () => {
     console.error(`Verity MCP Server running on Streamable HTTP: http://${httpHost}:${httpPort}${httpPath}`);
@@ -1411,7 +1552,19 @@ async function main() {
   await startStdioServer();
 }
 
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
-  process.exit(1);
-});
+function realEntrypointUrl(path: string): string {
+  try {
+    return pathToFileURL(realpathSync(path)).href;
+  } catch {
+    return pathToFileURL(path).href;
+  }
+}
+
+const entrypoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : undefined;
+const realEntrypoint = process.argv[1] ? realEntrypointUrl(process.argv[1]) : undefined;
+if (entrypoint === import.meta.url || realEntrypoint === import.meta.url) {
+  main().catch((error) => {
+    console.error("Fatal error in main():", error);
+    process.exit(1);
+  });
+}
