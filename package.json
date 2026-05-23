@@ -1,6 +1,6 @@
 {
   "name": "verity-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "MCP server for Verity healthcare API - Medicare coverage policies, prior auth, and medical codes",
   "type": "module",
   "bin": {
@@ -9,6 +9,7 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('build', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc",
+    "test": "npm run build && node scripts/mcp-smoke.mjs",
     "start": "node build/src/index.js",
     "start:http": "node build/src/index.js --http",
     "dev": "tsc --watch",
@@ -17,6 +18,9 @@
   "files": [
     "build"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^3.25.76"

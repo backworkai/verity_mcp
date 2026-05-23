@@ -8,6 +8,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 // Configuration
@@ -24,6 +25,49 @@ const allowedOrigins = parseAllowedList(process.env.VERITY_MCP_ALLOWED_ORIGINS |
 const allowedHosts = parseAllowedList(process.env.VERITY_MCP_ALLOWED_HOSTS || process.env.VERITY_MCP_ALLOW_HOST);
 
 type AuthenticatedIncomingMessage = IncomingMessage & { auth?: AuthInfo };
+type VerityToolInputSchema = z.ZodRawShape;
+type VerityToolConfig = {
+  title?: string;
+  description?: string;
+  inputSchema?: VerityToolInputSchema;
+  outputSchema?: VerityToolInputSchema;
+  annotations?: ToolAnnotations;
+  _meta?: Record<string, unknown>;
+};
+type VerityToolHandler = (args: any, extra: unknown) => CallToolResult | Promise<CallToolResult>;
+type RegisterVerityTool = (name: string, config: VerityToolConfig, handler: VerityToolHandler) => void;
+type ResponseFormat = "markdown" | "json";
+
+const responseFormatSchema = z
+  .enum(["markdown", "json"])
+  .default("markdown")
+  .describe("Output format: 'markdown' for readable text or 'json' for machine-readable structuredContent.");
+
+const verityToolOutputSchema = {
+  data: z.unknown().optional().describe("Structured data returned by the Verity API when available."),
+  meta: z.unknown().optional().describe("Response metadata such as pagination when available."),
+  message: z.string().describe("Human-readable result, status, or empty-result message."),
+};
+
+const mutatingTools = new Set([
+  "prior_auth_research",
+  "compliance_review",
+  "webhook_management",
+]);
+
+const destructiveTools = new Set(["webhook_management"]);
+const idempotentMutationTools = new Set(["compliance_review"]);
+
+const toolTitles: Record<string, string> = {
+  coverage_lookup: "Coverage Lookup",
+  policy_research: "Policy Research",
+  claim_validation: "Claim Validation",
+  prior_auth_research: "Prior Authorization Research",
+  drug_formulary_research: "Drug Formulary Research",
+  compliance_review: "Compliance Review",
+  webhook_management: "Webhook Management",
+  system_health: "System Health",
+};
 
 const includeSchema = z.union([z.string(), z.array(z.string())]).optional();
 
@@ -208,7 +252,19 @@ async function verityRequest<T>(
   });
 
   const text = await response.text();
-  const data = text ? JSON.parse(text) : { success: true, data: null };
+  let data: any;
+  try {
+    data = text ? JSON.parse(text) : { success: true, data: null };
+  } catch {
+    const preview = text.trim().slice(0, 300);
+    data = response.ok
+      ? { success: true, data: text }
+      : {
+          error: {
+            message: preview ? `API returned non-JSON response: ${preview}` : `API returned HTTP ${response.status} with an empty response body`,
+          },
+        };
+  }
 
   if (!response.ok) {
     throw new VerityApiError({
@@ -371,7 +427,7 @@ function formatCode(code: any): string {
       if (p.jurisdiction) lines.push(`    Jurisdiction: ${p.jurisdiction}`);
       if (p.source_url) lines.push(`    Source: ${p.source_url}`);
     });
-    if (remaining > 0) lines.push(`  ... ${remaining} more policies omitted. Use search_policies or get_policy for focused evidence.`);
+    if (remaining > 0) lines.push(`  ... ${remaining} more policies omitted. Use verity_policy_research for focused evidence.`);
   }
 
   if (code.suggestions && code.suggestions.length > 0) {
@@ -516,6 +572,149 @@ function formatPriorAuth(result: any): string {
 
 function formatJson(value: unknown): string {
   return JSON.stringify(value, null, 2);
+}
+
+function titleizeToolName(name: string): string {
+  return name
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function toolAnnotations(name: string): ToolAnnotations {
+  const readOnly = !mutatingTools.has(name);
+  return {
+    readOnlyHint: readOnly,
+    destructiveHint: destructiveTools.has(name),
+    idempotentHint: readOnly || idempotentMutationTools.has(name),
+    openWorldHint: true,
+  };
+}
+
+function withResponseFormatInput(inputSchema: VerityToolInputSchema = {}): VerityToolInputSchema {
+  if ("response_format" in inputSchema) return inputSchema;
+  return {
+    ...inputSchema,
+    response_format: responseFormatSchema,
+  };
+}
+
+function textFromToolResult(result: CallToolResult): string {
+  return result.content
+    .filter((item) => item.type === "text")
+    .map((item) => item.text)
+    .join("\n");
+}
+
+function isErrorText(text: string): boolean {
+  return /^(error|cannot|failed)\b/i.test(text.trim());
+}
+
+function splitResponseFormat(args: unknown): { handlerArgs: unknown; responseFormat: ResponseFormat } {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return { handlerArgs: args, responseFormat: "markdown" };
+  }
+
+  const { response_format, ...handlerArgs } = args as Record<string, unknown>;
+  return {
+    handlerArgs,
+    responseFormat: response_format === "json" ? "json" : "markdown",
+  };
+}
+
+function normalizeToolResult(result: CallToolResult, responseFormat: ResponseFormat): CallToolResult {
+  const text = textFromToolResult(result);
+  const isError = result.isError === true || isErrorText(text);
+
+  if (isError) {
+    return {
+      ...result,
+      isError: true,
+    };
+  }
+
+  const structuredContent = result.structuredContent ?? { message: text };
+  return {
+    ...result,
+    content:
+      responseFormat === "json"
+        ? [
+            {
+              type: "text",
+              text: formatJson(structuredContent),
+            },
+          ]
+        : result.content,
+    structuredContent,
+  };
+}
+
+function toolResult(message: string, data?: unknown, meta?: unknown): CallToolResult {
+  return {
+    content: [{ type: "text", text: message }],
+    structuredContent: {
+      ...(data !== undefined ? { data } : {}),
+      ...(meta !== undefined ? { meta } : {}),
+      message,
+    },
+  };
+}
+
+function toolError(message: string): CallToolResult {
+  return {
+    content: [{ type: "text", text: `Error: ${message}` }],
+    isError: true,
+  };
+}
+
+function enhanceDescription(name: string, description: string | undefined): string {
+  const baseDescription = description || `${titleizeToolName(name)} in the Verity API.`;
+  const responseFormatNote =
+    "Supports optional response_format: 'markdown' (default) for readable text or 'json' for the returned structuredContent object.";
+  return `${baseDescription}\n\n${responseFormatNote}`;
+}
+
+function enhanceToolConfig(name: string, config: VerityToolConfig): VerityToolConfig {
+  const title = config.title || toolTitles[name] || titleizeToolName(name);
+  return {
+    ...config,
+    title,
+    description: enhanceDescription(name, config.description),
+    inputSchema: withResponseFormatInput(config.inputSchema),
+    outputSchema: config.outputSchema || verityToolOutputSchema,
+    annotations: config.annotations || toolAnnotations(name),
+    _meta: config._meta,
+  };
+}
+
+function wrapToolHandler(name: string, handler: VerityToolHandler): VerityToolHandler {
+  return async (args: unknown, extra: unknown) => {
+    const { handlerArgs, responseFormat } = splitResponseFormat(args);
+
+    try {
+      return normalizeToolResult(await handler(handlerArgs, extra), responseFormat);
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error running ${name}: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  };
+}
+
+function createVerityToolRegistrar(server: McpServer): RegisterVerityTool {
+  return (name, config, handler) => {
+    const prefixedName = `verity_${name}`;
+    const wrappedHandler = wrapToolHandler(name, handler);
+    const primaryConfig = enhanceToolConfig(name, config);
+
+    server.registerTool(prefixedName, primaryConfig, wrappedHandler);
+  };
 }
 
 function formatBatchLookup(data: any): string {
@@ -775,878 +974,429 @@ function formatResearch(result: any): string {
   return lines.join("\n");
 }
 
+function registerWorkflowTools(registerTool: RegisterVerityTool): void {
+  registerTool(
+    "coverage_lookup",
+    {
+      description: `Answer common coverage questions for procedure codes in one workflow.
+Use this when a user asks whether codes are covered, whether prior authorization is required, what policies support the answer, or how coverage differs by jurisdiction.
+This tool can combine code lookup, related policy evidence, Medicare prior-auth checks, claim-risk validation, jurisdiction comparison, and spending evidence so the agent does not need to chain endpoint-shaped tools.`,
+      inputSchema: {
+        procedure_codes: z.array(z.string()).min(1).max(10).describe("CPT/HCPCS procedure codes, e.g. ['76942'] or ['J0585', '64493']"),
+        state: z.string().length(2).optional().describe("Two-letter patient state used to infer MAC jurisdiction, e.g. TX"),
+        jurisdiction: z.string().max(10).optional().describe("Optional MAC jurisdiction code for policy filtering, e.g. JM or JH"),
+        diagnosis_codes: z.array(z.string()).max(20).optional().describe("Diagnosis codes when claim-risk validation is needed"),
+        payer: z.string().max(80).optional().describe("Payer name or policy source label for claim validation"),
+        plan_type: z.enum(["commercial", "medicare_advantage", "medicaid", "traditional_medicare", "exchange"]).optional(),
+        date_of_service: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Date of service in YYYY-MM-DD format"),
+        site_of_service: z.enum(["office", "outpatient_hospital", "asc", "inpatient", "home", "telehealth"]).optional(),
+        compare_jurisdictions: z.array(z.string()).max(10).optional().describe("Jurisdictions to compare for regional coverage variation"),
+        include: z
+          .array(z.enum(["code_details", "prior_auth", "claim_risk", "jurisdiction_compare", "spending"]))
+          .default(["code_details", "prior_auth"])
+          .describe("Evidence modules to run. Defaults to code details and prior auth."),
+      },
+    },
+    async ({ procedure_codes, state, jurisdiction, diagnosis_codes, payer, plan_type, date_of_service, site_of_service, compare_jurisdictions, include }) => {
+      try {
+        const requested = new Set(include as string[]);
+        const data: Record<string, unknown> = {};
+        const lines = [`Coverage Lookup for ${procedure_codes.join(", ")}`];
+
+        if (requested.has("code_details")) {
+          const endpoint = procedure_codes.length === 1 ? "/codes/lookup" : "/codes/batch";
+          const result = await verityRequest<any>(
+            endpoint,
+            procedure_codes.length === 1
+              ? {
+                  params: {
+                    code: procedure_codes[0],
+                    jurisdiction,
+                    include: "rvu,policies",
+                    fuzzy: "true",
+                  },
+                }
+              : {
+                  method: "POST",
+                  body: { codes: procedure_codes, include: "rvu,policies" },
+                },
+          );
+          data.code_details = result.data;
+          lines.push("\n--- Code Details ---");
+          lines.push(procedure_codes.length === 1 ? formatCode(result.data) : formatBatchLookup(result.data));
+        }
+
+        if (requested.has("prior_auth")) {
+          const result = await verityRequest<any>("/prior-auth/check", {
+            method: "POST",
+            body: { procedure_codes, state },
+          });
+          data.prior_auth = result.data;
+          lines.push("\n--- Prior Authorization ---");
+          lines.push(formatPriorAuth(result.data));
+        }
+
+        if (requested.has("claim_risk")) {
+          const result = await verityRequest<any>("/claims/validate", {
+            method: "POST",
+            body: {
+              procedure_codes,
+              diagnosis_codes,
+              payer,
+              plan_type,
+              state,
+              date_of_service,
+              site_of_service,
+            },
+          });
+          data.claim_risk = result.data;
+          lines.push("\n--- Claim Risk ---");
+          lines.push(formatClaimValidation(result.data));
+        }
+
+        if (requested.has("jurisdiction_compare") || compare_jurisdictions?.length) {
+          const result = await verityRequest<any>("/policies/compare", {
+            method: "POST",
+            body: { procedure_codes, jurisdictions: compare_jurisdictions },
+          });
+          data.jurisdiction_compare = result.data;
+          const summary = result.data.summary;
+          lines.push("\n--- Jurisdiction Comparison ---");
+          lines.push(`Jurisdictions analyzed: ${summary.total_jurisdictions}`);
+          lines.push(`With coverage: ${summary.jurisdictions_with_coverage}`);
+          lines.push(`Regional variation: ${summary.has_variation ? "YES" : "NO"}`);
+          if (result.data.comparison?.length) {
+            result.data.comparison.slice(0, 8).forEach((jur: any) => {
+              lines.push(`- ${jur.jurisdiction}: ${jur.coverage_summary ? JSON.stringify(jur.coverage_summary) : "no summary"}`);
+            });
+          }
+        }
+
+        if (requested.has("spending")) {
+          const result = await verityRequest<any>("/spending/by-code", {
+            params: procedure_codes.length === 1 ? { code: procedure_codes[0] } : { codes: procedure_codes.join(",") },
+          });
+          data.spending = result.data;
+          lines.push("\n--- Spending ---");
+          lines.push(formatSpending(result.data));
+        }
+
+        return toolResult(lines.join("\n"), data);
+      } catch (error) {
+        return { content: [{ type: "text", text: formatToolError("run coverage lookup", error) }] };
+      }
+    },
+  );
+
+  registerTool(
+    "policy_research",
+    {
+      description: `Research coverage policies and criteria.
+Use this for policy search, fetching one policy by ID, searching extracted criteria, reviewing policy changes, or mapping state to MAC jurisdiction. This replaces several endpoint-shaped policy tools with one research workflow.`,
+      inputSchema: {
+        action: z.enum(["search", "get", "criteria", "changes", "jurisdictions"]).describe("Policy research action to perform"),
+        query: z.string().max(500).optional().describe("Search text for policy or criteria research"),
+        policy_id: z.string().max(80).optional().describe("Policy ID for action='get' or filtering changes"),
+        policy_type: z.enum(["LCD", "Article", "NCD", "PayerPolicy", "Medical Policy", "Drug Policy"]).optional(),
+        jurisdiction: z.string().max(10).optional(),
+        payer: z.string().max(80).optional(),
+        status: z.enum(["active", "retired", "all"]).default("active"),
+        mode: z.enum(["keyword", "semantic"]).default("keyword"),
+        section: z.enum(["indications", "limitations", "documentation", "frequency", "other"]).optional(),
+        since: z.string().optional().describe("ISO 8601 timestamp for policy changes"),
+        change_type: z.enum(["created", "updated", "retired", "codes_changed", "criteria_changed", "metadata_changed"]).optional(),
+        include: includeSchema.describe("Extra policy data, e.g. ['criteria', 'codes']"),
+        limit: z.number().int().min(1).max(50).default(10),
+        cursor: z.string().optional(),
+      },
+    },
+    async ({ action, query, policy_id, policy_type, jurisdiction, payer, status, mode, section, since, change_type, include, limit, cursor }) => {
+      try {
+        if (action === "search") {
+          const result = await verityRequest<any>("/policies", {
+            params: { q: query, mode, policy_type, jurisdiction, payer, status, limit, cursor, include: normalizeInclude(include) },
+          });
+          if (!result.data?.length) return toolResult(`No policies found for "${query || "your search"}".`, result.data, result.meta);
+          const lines = [`Found ${result.data.length} policies${result.meta?.pagination?.has_more ? " (more available)" : ""}:\n`];
+          result.data.forEach((policy: any, i: number) => lines.push(`${i + 1}. ${formatPolicy(policy)}\n`));
+          if (result.meta?.pagination?.cursor) lines.push(`More results available. Use cursor: "${result.meta.pagination.cursor}"`);
+          return toolResult(lines.join("\n"), result.data, result.meta);
+        }
+
+        if (action === "get") {
+          if (!policy_id) return toolError("policy_id is required when action='get'.");
+          const result = await verityRequest<any>(`/policies/${encodeURIComponent(policy_id)}`, {
+            params: { include: normalizeInclude(include, "criteria,codes") },
+          });
+          return toolResult(formatPolicy(result.data, true), result.data, result.meta);
+        }
+
+        if (action === "criteria") {
+          if (!query) return toolError("query is required when action='criteria'.");
+          const result = await verityRequest<any>("/coverage/criteria", {
+            params: { q: query, section, policy_type, jurisdiction, limit, cursor },
+          });
+          if (!result.data?.length) return toolResult(`No criteria found for "${query}".`, result.data, result.meta);
+          const lines = [`Found ${result.data.length} matching criteria:\n`];
+          result.data.forEach((criteria: any, i: number) => {
+            const id = criteria.policy_id ?? criteria.policy?.policy_id ?? "unknown policy";
+            const title = criteria.policy_title ?? criteria.policy?.title ?? "Untitled policy";
+            lines.push(`${i + 1}. [${criteria.section.toUpperCase()}] ${id}: ${cleanText(title, 140)}`);
+            lines.push(`   ${cleanText(criteria.text, 320)}\n`);
+          });
+          if (result.meta?.pagination?.cursor) lines.push(`More results available. Use cursor: "${result.meta.pagination.cursor}"`);
+          return toolResult(lines.join("\n"), result.data, result.meta);
+        }
+
+        if (action === "changes") {
+          const result = await verityRequest<any>("/policies/changes", {
+            params: { since, policy_id, change_type, limit, cursor },
+          });
+          if (!result.data?.length) return toolResult("No policy changes found for the specified criteria.", result.data, result.meta);
+          const lines = [`Found ${result.data.length} policy changes:\n`];
+          result.data.forEach((change: any) => {
+            lines.push(`[${change.change_type?.toUpperCase?.() ?? "CHANGE"}] ${change.policy_id}: ${change.policy_title}`);
+            if (change.changed_at) lines.push(`  Date: ${change.changed_at}`);
+            if (change.change_summary) lines.push(`  Summary: ${change.change_summary}`);
+          });
+          if (result.meta?.pagination?.cursor) lines.push(`More changes available. Use cursor: "${result.meta.pagination.cursor}"`);
+          return toolResult(lines.join("\n"), result.data, result.meta);
+        }
+
+        const result = await verityRequest<any>("/jurisdictions");
+        const lines = [`MAC Jurisdictions (${result.data.length} total):\n`];
+        result.data.forEach((jur: any) => {
+          lines.push(`[${jur.jurisdiction_code}] ${jur.jurisdiction_name || ""}`);
+          lines.push(`  MAC: ${jur.mac_name}${jur.mac_code ? ` (${jur.mac_code})` : ""}`);
+          if (jur.states?.length) lines.push(`  States: ${jur.states.join(", ")}`);
+          if (jur.website_url) lines.push(`  Website: ${jur.website_url}`);
+          lines.push("");
+        });
+        return toolResult(lines.join("\n"), result.data, result.meta);
+      } catch (error) {
+        return { content: [{ type: "text", text: formatToolError("research policies", error) }] };
+      }
+    },
+  );
+
+  registerTool(
+    "claim_validation",
+    {
+      description: "Validate claim coverage, documentation requirements, denial risk, and optional policy-specific criteria in one workflow.",
+      inputSchema: {
+        procedure_codes: z.array(z.string()).min(1).max(10).describe("CPT/HCPCS procedure codes"),
+        diagnosis_codes: z.array(z.string()).max(20).optional(),
+        payer: z.string().optional().describe("Payer or policy source label"),
+        plan_type: z.enum(["commercial", "medicare_advantage", "medicaid", "traditional_medicare", "exchange"]).optional(),
+        line_of_business: z.string().optional(),
+        modifiers: z.array(z.string()).max(5).optional(),
+        state: z.string().length(2).optional(),
+        date_of_service: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        site_of_service: z.enum(["office", "outpatient_hospital", "asc", "inpatient", "home", "telehealth"]).optional(),
+        provider_specialty: z.string().optional(),
+        age_category: z.enum(["pediatric", "adult", "medicare_age"]).optional(),
+        sex_when_policy_relevant: z.enum(["female", "male", "other", "unknown"]).optional(),
+        policy_id: z.string().optional().describe("Optional policy ID to evaluate against structured parameters"),
+        coverage_parameters: z.record(z.unknown()).optional().describe("Policy criteria inputs when policy_id is supplied"),
+        idempotency_key: z.string().optional(),
+      },
+    },
+    async ({ idempotency_key, policy_id, coverage_parameters, ...body }) => {
+      try {
+        const data: Record<string, unknown> = {};
+        const lines = ["Claim Validation"];
+        const result = await verityRequest<any>("/claims/validate", {
+          method: "POST",
+          body,
+          headers: idempotency_key ? { "X-Idempotency-Key": idempotency_key } : undefined,
+        });
+        data.claim_validation = result.data;
+        lines.push(formatClaimValidation(result.data));
+
+        if (policy_id && coverage_parameters) {
+          const evaluation = await verityRequest<any>("/coverage/evaluate", {
+            method: "POST",
+            body: { policy_id, parameters: coverage_parameters },
+          });
+          data.coverage_evaluation = evaluation.data;
+          lines.push("\n--- Policy Criteria Evaluation ---");
+          lines.push(formatJson(evaluation.data));
+        }
+
+        return toolResult(lines.join("\n"), data);
+      } catch (error) {
+        return { content: [{ type: "text", text: formatToolError("validate claim", error) }] };
+      }
+    },
+  );
+
+  registerTool(
+    "prior_auth_research",
+    {
+      description: "Check, start, or poll payer prior-authorization research without exposing separate task-management tools.",
+      inputSchema: {
+        action: z.enum(["check", "start_research", "get_research"]).describe("Use check for immediate Medicare PA evidence, start_research for payer website research, get_research to poll a research_id"),
+        procedure_codes: z.array(z.string()).min(1).max(10).optional(),
+        research_id: z.string().optional(),
+        payer: z.string().optional(),
+        state: z.string().length(2).optional(),
+        diagnosis_codes: z.array(z.string()).max(20).optional(),
+        clinical_context: z.string().max(2000).optional(),
+        sync: z.boolean().default(false),
+      },
+    },
+    async ({ action, procedure_codes, research_id, ...body }) => {
+      try {
+        if (action === "get_research") {
+          if (!research_id) return toolError("research_id is required when action='get_research'.");
+          const result = await verityRequest<any>(`/prior-auth/research/${encodeURIComponent(research_id)}`);
+          return toolResult(formatResearch(result.data), result.data, result.meta);
+        }
+
+        if (!procedure_codes?.length) return toolError("procedure_codes is required for prior authorization checks and research.");
+
+        if (action === "check") {
+          const result = await verityRequest<any>("/prior-auth/check", {
+            method: "POST",
+            body: { procedure_codes, state: body.state },
+          });
+          return toolResult(formatPriorAuth(result.data), result.data, result.meta);
+        }
+
+        const result = await verityRequest<any>("/prior-auth/research", {
+          method: "POST",
+          body: { ...body, procedure_codes },
+        });
+        return toolResult(formatResearch(result.data), result.data, result.meta);
+      } catch (error) {
+        return { content: [{ type: "text", text: formatToolError("research prior auth", error) }] };
+      }
+    },
+  );
+
+  registerTool(
+    "drug_formulary_research",
+    {
+      description: "Search commercial pharmacy-benefit evidence from CVS Caremark, Express Scripts, and UnitedHealthcare / Optum Rx.",
+      inputSchema: {
+        query: z.string().min(2).max(200).describe("Drug, class, or formulary requirement to search for"),
+        payer: z.enum(["all", "cvs_caremark", "express_scripts", "uhc"]).default("all"),
+        limit: z.number().int().min(1).max(50).default(10),
+      },
+    },
+    async ({ query, payer, limit }) => {
+      try {
+        const result = await verityRequest<any>("/drugs/formulary", { params: { q: query, payer, limit } });
+        return toolResult(formatDrugFormulary(result.data, query, result.meta), result.data, result.meta);
+      } catch (error) {
+        return { content: [{ type: "text", text: formatToolError("search drug formulary", error) }] };
+      }
+    },
+  );
+
+  registerTool(
+    "compliance_review",
+    {
+      description: "Review compliance dashboard state, list unreviewed policy changes, or acknowledge changes when explicitly requested.",
+      inputSchema: {
+        action: z.enum(["stats", "list_unreviewed", "acknowledge", "bulk_acknowledge"]),
+        change_type: z.string().optional(),
+        cursor: z.string().optional(),
+        limit: z.number().int().min(1).max(100).default(25),
+        diff_id: z.number().int().optional(),
+        diff_ids: z.array(z.number().int()).min(1).max(200).optional(),
+        notes: z.string().max(500).optional(),
+      },
+    },
+    async ({ action, change_type, cursor, limit, diff_id, diff_ids, notes }) => {
+      try {
+        if (action === "stats") {
+          const result = await verityRequest<any>("/compliance/stats");
+          return toolResult(formatComplianceStats(result.data), result.data, result.meta);
+        }
+        if (action === "list_unreviewed") {
+          const result = await verityRequest<any>("/compliance/unreviewed", { params: { change_type, cursor, limit } });
+          return toolResult(formatJson({ data: result.data, meta: result.meta }), result.data, result.meta);
+        }
+        if (action === "acknowledge") {
+          if (diff_id === undefined) return toolError("diff_id is required when action='acknowledge'.");
+          const result = await verityRequest<any>("/compliance/ack", { method: "POST", body: { diff_id, notes } });
+          return toolResult(formatMutationResult("Acknowledge policy change", result.data), result.data, result.meta);
+        }
+        if (!diff_ids?.length) return toolError("diff_ids is required when action='bulk_acknowledge'.");
+        const result = await verityRequest<any>("/compliance/ack/bulk", { method: "POST", body: { diff_ids, notes } });
+        return toolResult(formatMutationResult("Bulk acknowledge policy changes", result.data), result.data, result.meta);
+      } catch (error) {
+        return { content: [{ type: "text", text: formatToolError("review compliance", error) }] };
+      }
+    },
+  );
+
+  registerTool(
+    "webhook_management",
+    {
+      description: "List, create, update, delete, or test webhook endpoints. Use only when the user is explicitly managing webhook configuration.",
+      inputSchema: {
+        action: z.enum(["list", "create", "update", "delete", "test"]),
+        id: z.number().int().optional(),
+        url: z.string().url().refine((value) => new URL(value).protocol === "https:", "Webhook URL must use HTTPS").optional(),
+        events: z.array(z.string()).optional(),
+        status: z.enum(["active", "paused"]).optional(),
+      },
+    },
+    async ({ action, id, url, events, status }) => {
+      try {
+        if (action === "list") {
+          const result = await verityRequest<any>("/webhooks");
+          return toolResult(formatWebhookList(result.data), result.data, result.meta);
+        }
+        if (action === "create") {
+          if (!url || !events?.length) return toolError("url and at least one event are required when action='create'.");
+          const result = await verityRequest<any>("/webhooks", { method: "POST", body: { url, events } });
+          return toolResult(formatMutationResult("Create webhook", result.data), result.data, result.meta);
+        }
+        if (id === undefined) return toolError("id is required when action is update, delete, or test.");
+        if (action === "update") {
+          const result = await verityRequest<any>(`/webhooks/${id}`, { method: "PATCH", body: { url, events, status } });
+          return toolResult(formatMutationResult("Update webhook", result.data), result.data, result.meta);
+        }
+        if (action === "delete") {
+          const result = await verityRequest<any>(`/webhooks/${id}`, { method: "DELETE" });
+          return toolResult(formatMutationResult("Delete webhook", result.data), result.data, result.meta);
+        }
+        const result = await verityRequest<any>(`/webhooks/${id}/test`, { method: "POST" });
+        return toolResult(formatMutationResult("Test webhook", result.data), result.data, result.meta);
+      } catch (error) {
+        return { content: [{ type: "text", text: formatToolError("manage webhooks", error) }] };
+      }
+    },
+  );
+
+  registerTool(
+    "system_health",
+    {
+      description: "Check Verity API health and dependency status. Use for diagnostics, not for coverage research.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const result = await verityRequest<any>("/health");
+        return toolResult(formatJson(result.data), result.data, result.meta);
+      } catch (error) {
+        return { content: [{ type: "text", text: formatToolError("check health", error) }] };
+      }
+    },
+  );
+}
+
 function createVerityMcpServer(): McpServer {
 const server = new McpServer({
   name: "verity",
-  version: "1.0.0",
+  version: "1.1.0",
 });
+const registerTool = createVerityToolRegistrar(server);
 
-// Register tools
-
-// 1. lookup_code - Look up medical codes
-server.registerTool(
-  "lookup_code",
-  {
-    description: `Look up a medical code (CPT, HCPCS, ICD-10, or NDC) and get coverage information.
-Returns code details, descriptions, RVU values, and related Medicare policies.
-Use this to understand what a code means and whether it's covered.
-
-Examples:
-- lookup_code("76942") - ultrasound guidance
-- lookup_code("J0585") - Botox injection
-- lookup_code("M54.5") - low back pain diagnosis`,
-    inputSchema: {
-      code: z.string().min(1).max(20).describe("The medical code to look up (e.g., 76942, J0585, M54.5)"),
-      code_system: z
-        .enum(["CPT", "HCPCS", "ICD10CM", "ICD10PCS", "NDC"])
-        .optional()
-        .describe("Code system hint - auto-detected if not provided"),
-      jurisdiction: z.string().max(10).optional().describe("MAC jurisdiction code to filter policies (e.g., JM, JH)"),
-      include: includeSchema.describe("Additional data as an array or comma string, e.g. ['rvu', 'policies']"),
-      fuzzy: z.boolean().default(true).describe("Enable fuzzy matching for typos/partial codes"),
-    },
-  },
-  async ({ code, code_system, jurisdiction, include, fuzzy }) => {
-    try {
-      const result = await verityRequest<any>("/codes/lookup", {
-        params: {
-          code,
-          code_system,
-          jurisdiction,
-          include: normalizeInclude(include, "rvu,policies"),
-          fuzzy: fuzzy ? "true" : "false",
-        },
-      });
-
-      if (!result.data.found && (!result.data.suggestions || result.data.suggestions.length === 0)) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Code "${code}" not found. Try:\n- Check spelling\n- Use a different code system\n- Search for the procedure name using search_policies`,
-            },
-          ],
-        };
-      }
-
-      return {
-        content: [{ type: "text", text: formatCode(result.data) }],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: formatToolError("look up code", error) }],
-      };
-    }
-  }
-);
-
-// 2. search_policies - Search coverage policies
-server.registerTool(
-  "search_policies",
-  {
-    description: `Search Medicare coverage policies (LCDs, NCDs, Articles).
-Use this to find policies related to procedures, conditions, or coverage questions.
-Supports keyword and semantic search modes.
-
-Examples:
-- search_policies("ultrasound guidance") - find policies about ultrasound
-- search_policies("diabetes CGM") - find continuous glucose monitor policies
-- search_policies("", { policy_type: "NCD" }) - list all National Coverage Determinations`,
-    inputSchema: {
-      query: z.string().max(500).optional().describe("Search query - leave empty to browse"),
-      mode: z.enum(["keyword", "semantic"]).default("keyword").describe("Search mode: keyword (exact) or semantic (conceptual)"),
-      policy_type: z
-        .enum(["LCD", "Article", "NCD", "PayerPolicy", "Medical Policy", "Drug Policy"])
-        .optional()
-        .describe("Filter by policy type"),
-      jurisdiction: z.string().max(10).optional().describe("MAC jurisdiction code (e.g., JM, JH, JK)"),
-      payer: z.string().max(50).optional().describe("Filter by payer name"),
-      status: z.enum(["active", "retired", "all"]).default("active").describe("Policy status filter"),
-      limit: z.number().min(1).max(100).default(20).describe("Results per page"),
-      cursor: z.string().optional().describe("Pagination cursor from previous response"),
-      include: z.string().optional().describe("Additional data: 'summary', 'criteria', 'codes'"),
-    },
-  },
-  async ({ query, mode, policy_type, jurisdiction, payer, status, limit, cursor, include }) => {
-    try {
-      const result = await verityRequest<any>("/policies", {
-        params: {
-          q: query,
-          mode,
-          policy_type,
-          jurisdiction,
-          payer,
-          status,
-          limit,
-          cursor,
-          include,
-        },
-      });
-
-      if (!result.data || result.data.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `No policies found for "${query || "your search"}". Try:\n- Broader search terms\n- Different policy type\n- Remove jurisdiction filter`,
-            },
-          ],
-        };
-      }
-
-      const lines: string[] = [`Found ${result.data.length} policies${result.meta?.pagination?.has_more ? " (more available)" : ""}:\n`];
-
-      result.data.forEach((policy: any, i: number) => {
-        lines.push(`${i + 1}. ${formatPolicy(policy)}`);
-        lines.push("");
-      });
-
-      if (result.meta?.pagination?.cursor) {
-        lines.push(`\nMore results available. Use cursor: "${result.meta.pagination.cursor}"`);
-      }
-
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: formatToolError("search policies", error) }],
-      };
-    }
-  }
-);
-
-// 3. get_policy - Get a specific policy by ID
-server.registerTool(
-  "get_policy",
-  {
-    description: `Get detailed information about a specific Medicare coverage policy.
-Use this after finding a policy ID from search_policies or lookup_code.
-Can include criteria, codes, attachments, and version history.
-
-Examples:
-- get_policy("L33831") - LCD for ultrasound guidance
-- get_policy("A52458", { include: "criteria,codes" }) - with coverage criteria`,
-    inputSchema: {
-      policy_id: z.string().min(1).describe("Policy ID (e.g., L33831, A52458, NCD220.6)"),
-      include: includeSchema.describe("Additional data as an array or comma string, e.g. ['criteria', 'codes']"),
-    },
-  },
-  async ({ policy_id, include }) => {
-    try {
-      const result = await verityRequest<any>(`/policies/${encodeURIComponent(policy_id)}`, {
-        params: { include: normalizeInclude(include) },
-      });
-
-      return {
-        content: [{ type: "text", text: formatPolicy(result.data, true) }],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: formatToolError("get policy", error) }],
-      };
-    }
-  }
-);
-
-// 4. compare_policies - Compare policies across jurisdictions
-server.registerTool(
-  "compare_policies",
-  {
-    description: `Compare coverage policies across different MAC jurisdictions for specific procedure codes.
-Useful to understand regional coverage differences for the same procedures.
-Shows national vs. jurisdiction-specific policies.
-
-Examples:
-- compare_policies(["76942"]) - compare ultrasound guidance coverage nationally
-- compare_policies(["76942", "76937"], { jurisdictions: ["JM", "JH"] }) - compare specific regions`,
-    inputSchema: {
-      procedure_codes: z
-        .array(z.string())
-        .min(1)
-        .max(10)
-        .describe("CPT/HCPCS codes to compare (1-10 codes)"),
-      policy_type: z.enum(["LCD", "Article", "NCD"]).optional().describe("Filter by policy type"),
-      jurisdictions: z
-        .array(z.string())
-        .max(10)
-        .optional()
-        .describe("Specific jurisdictions to compare (e.g., ['JM', 'JH'])"),
-    },
-  },
-  async ({ procedure_codes, policy_type, jurisdictions }) => {
-    try {
-      const result = await verityRequest<any>("/policies/compare", {
-        method: "POST",
-        body: { procedure_codes, policy_type, jurisdictions },
-      });
-
-      const lines: string[] = [];
-      const summary = result.data.summary;
-
-      lines.push(`Coverage Comparison for: ${summary.queried_codes.join(", ")}`);
-      if (summary.requested_jurisdictions?.length) {
-        lines.push(`Requested jurisdictions: ${summary.requested_jurisdictions.join(", ")}`);
-      }
-      lines.push(`Jurisdictions analyzed: ${summary.total_jurisdictions}`);
-      lines.push(`With coverage: ${summary.jurisdictions_with_coverage}`);
-      lines.push(`National policies: ${summary.national_policies_count}`);
-      lines.push(`Regional variation: ${summary.has_variation ? "YES" : "NO"}`);
-      if (summary.unresolved_jurisdictions?.length) {
-        lines.push(`Unresolved jurisdictions: ${summary.unresolved_jurisdictions.join(", ")}`);
-      }
-
-      // National policies
-      if (result.data.national_policies?.length > 0) {
-        lines.push("\n--- NATIONAL POLICIES ---");
-        result.data.national_policies.slice(0, 5).forEach((p: any) => {
-          lines.push(`\n${p.policy_id}: ${p.title}`);
-          lines.push(`Type: ${p.policy_type}`);
-          if (p.source_url) lines.push(`Source: ${p.source_url}`);
-          if (p.codes?.length > 0) {
-            p.codes.slice(0, 5).forEach((c: any) => {
-              lines.push(`  - ${c.code}: ${c.disposition}`);
-            });
-            if (p.codes.length > 5) lines.push(`  ... ${p.codes.length - 5} more codes omitted`);
-          }
-        });
-        if (result.data.national_policies.length > 5) {
-          lines.push(`\n... ${result.data.national_policies.length - 5} more national policies omitted`);
-        }
-      }
-
-      // Jurisdiction comparison
-      if (result.data.comparison?.length > 0) {
-        lines.push("\n--- BY JURISDICTION ---");
-        result.data.comparison.forEach((jur: any) => {
-          lines.push(`\n[${jur.jurisdiction}] ${jur.mac?.name || ""}`);
-          if (jur.mac?.states) lines.push(`States: ${jur.mac.states.join(", ")}`);
-
-          if (jur.coverage_summary) {
-            const cs = jur.coverage_summary;
-            lines.push(`Coverage: ${cs.covered} covered, ${cs.not_covered} not covered, ${cs.requires_pa} require PA, ${cs.conditional} conditional`);
-          }
-
-          if (jur.policies?.length > 0) {
-            jur.policies.slice(0, 5).forEach((p: any) => {
-              lines.push(`  ${p.policy_id}: ${p.title}`);
-              if (p.source_url) lines.push(`    Source: ${p.source_url}`);
-            });
-            if (jur.policies.length > 5) lines.push(`  ... ${jur.policies.length - 5} more policies omitted`);
-          } else {
-            lines.push("  No local policies found");
-          }
-        });
-      }
-
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: formatToolError("compare policies", error) }],
-      };
-    }
-  }
-);
-
-// 5. get_policy_changes - Track policy updates
-server.registerTool(
-  "get_policy_changes",
-  {
-    description: `Track recent changes to Medicare coverage policies.
-Useful for monitoring updates, new policies, and retirements.
-Can filter by date, policy ID, or change type.
-
-Examples:
-- get_policy_changes() - recent changes
-- get_policy_changes({ since: "2024-01-01T00:00:00Z" }) - changes since date
-- get_policy_changes({ policy_id: "L33831" }) - changes to specific policy`,
-    inputSchema: {
-      since: z.string().optional().describe("ISO8601 timestamp - only changes after this date"),
-      policy_id: z.string().max(50).optional().describe("Filter to a specific policy"),
-      change_type: z
-        .enum(["created", "updated", "retired", "codes_changed", "criteria_changed", "metadata_changed"])
-        .optional()
-        .describe("Filter by type of change"),
-      limit: z.number().min(1).max(100).default(20).describe("Results per page"),
-      cursor: z.string().optional().describe("Pagination cursor"),
-    },
-  },
-  async ({ since, policy_id, change_type, limit, cursor }) => {
-    try {
-      const result = await verityRequest<any>("/policies/changes", {
-        params: { since, policy_id, change_type, limit, cursor },
-      });
-
-      if (!result.data || result.data.length === 0) {
-        return {
-          content: [{ type: "text", text: "No policy changes found for the specified criteria." }],
-        };
-      }
-
-      const lines: string[] = [`Found ${result.data.length} policy changes:\n`];
-
-      result.data.forEach((change: any) => {
-        lines.push(`[${change.change_type.toUpperCase()}] ${change.policy_id}: ${change.policy_title}`);
-        if (change.changed_at) lines.push(`  Date: ${change.changed_at}`);
-        if (change.change_summary) lines.push(`  Summary: ${change.change_summary}`);
-        const changedFields = asArray(change.details?.changed_fields).map(String);
-        const addedCodes = asArray(change.details?.added_codes).map(String);
-        const removedCodes = asArray(change.details?.removed_codes).map(String);
-        if (changedFields.length) lines.push(`  Fields: ${changedFields.join(", ")}`);
-        if (addedCodes.length) lines.push(`  Added codes: ${addedCodes.join(", ")}`);
-        if (removedCodes.length) lines.push(`  Removed codes: ${removedCodes.join(", ")}`);
-        lines.push("");
-      });
-
-      if (result.meta?.pagination?.cursor) {
-        lines.push(`More changes available. Use cursor: "${result.meta.pagination.cursor}"`);
-      }
-
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: formatToolError("get policy changes", error) }],
-      };
-    }
-  }
-);
-
-// 6. search_criteria - Search coverage criteria
-server.registerTool(
-  "search_criteria",
-  {
-    description: `Search through coverage criteria blocks across Medicare policies.
-Find specific indications, limitations, or documentation requirements.
-More targeted than full policy search.
-
-Examples:
-- search_criteria("diabetes") - criteria mentioning diabetes
-- search_criteria("BMI", { section: "indications" }) - BMI requirements for coverage
-- search_criteria("frequency", { section: "limitations" }) - frequency limitations`,
-    inputSchema: {
-      query: z.string().min(1).max(500).describe("Search query for criteria text"),
-      section: z
-        .enum(["indications", "limitations", "documentation", "frequency", "other"])
-        .optional()
-        .describe("Filter by criteria section type"),
-      policy_type: z.enum(["LCD", "Article", "NCD", "PayerPolicy"]).optional().describe("Filter by policy type"),
-      jurisdiction: z.string().max(10).optional().describe("Filter by MAC jurisdiction"),
-      limit: z.number().min(1).max(100).default(20).describe("Results per page"),
-      cursor: z.string().optional().describe("Pagination cursor"),
-    },
-  },
-  async ({ query, section, policy_type, jurisdiction, limit, cursor }) => {
-    try {
-      const result = await verityRequest<any>("/coverage/criteria", {
-        params: { q: query, section, policy_type, jurisdiction, limit, cursor },
-      });
-
-      if (!result.data || result.data.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `No criteria found for "${query}". Try:\n- Broader search terms\n- Remove section filter\n- Search full policies instead`,
-            },
-          ],
-        };
-      }
-
-      const lines: string[] = [`Found ${result.data.length} matching criteria:\n`];
-
-      result.data.forEach((criteria: any, i: number) => {
-        const policyId = criteria.policy_id ?? criteria.policy?.policy_id ?? "unknown policy";
-        const policyTitle = criteria.policy_title ?? criteria.policy?.title ?? "Untitled policy";
-        const policyType = criteria.policy_type ?? criteria.policy?.policy_type;
-        const jurisdiction = criteria.jurisdiction ?? criteria.policy?.jurisdiction;
-        const context = [policyType, jurisdiction].filter(Boolean).join(" / ");
-        lines.push(`${i + 1}. [${criteria.section.toUpperCase()}] from ${policyId}`);
-        lines.push(`   Policy: ${policyTitle}${context ? ` (${context})` : ""}`);
-        lines.push(`   Text: ${criteria.text.slice(0, 300)}${criteria.text.length > 300 ? "..." : ""}`);
-        if (criteria.tags?.length) lines.push(`   Tags: ${criteria.tags.join(", ")}`);
-        if (criteria.requires_manual_review) lines.push(`   Note: Requires manual review`);
-        lines.push("");
-      });
-
-      if (result.meta?.pagination?.cursor) {
-        lines.push(`More results available. Use cursor: "${result.meta.pagination.cursor}"`);
-      }
-
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: formatToolError("search criteria", error) }],
-      };
-    }
-  }
-);
-
-// 7. list_jurisdictions - List MAC jurisdictions
-server.registerTool(
-  "list_jurisdictions",
-  {
-    description: `Get list of Medicare Administrative Contractor (MAC) jurisdictions.
-Returns MAC names, jurisdiction codes, and covered states.
-Use this to find the right jurisdiction for a patient's state.
-
-Example:
-- list_jurisdictions() - get all MAC jurisdictions and their states`,
-    inputSchema: {},
-  },
-  async () => {
-    try {
-      const result = await verityRequest<any>("/jurisdictions");
-
-      const lines: string[] = [`MAC Jurisdictions (${result.data.length} total):\n`];
-
-      result.data.forEach((jur: any) => {
-        lines.push(`[${jur.jurisdiction_code}] ${jur.jurisdiction_name || ""}`);
-        lines.push(`  MAC: ${jur.mac_name}${jur.mac_code ? ` (${jur.mac_code})` : ""}`);
-        if (jur.states?.length) lines.push(`  States: ${jur.states.join(", ")}`);
-        if (jur.mac_type) lines.push(`  Type: ${jur.mac_type}`);
-        if (jur.website_url) lines.push(`  Website: ${jur.website_url}`);
-        lines.push("");
-      });
-
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: formatToolError("list jurisdictions", error) }],
-      };
-    }
-  }
-);
-
-// 8. check_prior_auth - Check Medicare prior authorization requirements
-server.registerTool(
-  "check_prior_auth",
-  {
-    description: `Check if procedures require prior authorization for Medicare.
-Returns PA requirement, confidence level, matched LCD/NCD policies, and documentation checklist.
-Essential for determining Medicare coverage requirements before procedures.
-
-Examples:
-- check_prior_auth(["76942"]) - check PA for ultrasound guidance
-- check_prior_auth(["76942"], { state: "TX" }) - check for Texas patient (determines MAC jurisdiction)
-- check_prior_auth(["J0585", "64493"]) - check multiple procedure codes`,
-    inputSchema: {
-      procedure_codes: z
-        .array(z.string())
-        .min(1)
-        .max(10)
-        .describe("CPT/HCPCS codes to check (1-10 codes)"),
-      state: z
-        .string()
-        .length(2)
-        .optional()
-        .describe("Two-letter state code to determine MAC jurisdiction (e.g., TX, CA)"),
-    },
-  },
-  async ({ procedure_codes, state }) => {
-    try {
-      const result = await verityRequest<any>("/prior-auth/check", {
-        method: "POST",
-        body: { procedure_codes, state },
-      });
-
-      return {
-        content: [{ type: "text", text: formatPriorAuth(result.data) }],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: formatToolError("check prior auth", error) }],
-      };
-    }
-  }
-);
-
-// 9. get_health - API health check
-server.registerTool(
-  "get_health",
-  {
-    description: "Check Verity API health and dependency status.",
-    inputSchema: {},
-  },
-  async () => {
-    try {
-      const result = await verityRequest<any>("/health");
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("check health", error) }] };
-    }
-  }
-);
-
-// 10. get_spending_by_code - Medicaid spending data
-server.registerTool(
-  "get_spending_by_code",
-  {
-    description: "Get Medicaid provider spending statistics for one or more HCPCS codes.",
-    inputSchema: {
-      code: z.string().optional().describe("Single HCPCS code"),
-      codes: z.array(z.string()).max(10).optional().describe("Multiple HCPCS codes"),
-      year: z.number().int().optional().describe("Optional year filter"),
-    },
-  },
-  async ({ code, codes, year }) => {
-    try {
-      if ((code && codes?.length) || (!code && !codes?.length)) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error getting spending data: provide exactly one of code or codes.",
-            },
-          ],
-        };
-      }
-
-      const result = await verityRequest<any>("/spending/by-code", {
-        params: { code, codes: codes?.join(","), year },
-      });
-      return { content: [{ type: "text", text: formatSpending(result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("get spending data", error) }] };
-    }
-  }
-);
-
-// 11. validate_claim - Claim coverage and denial risk
-server.registerTool(
-  "validate_claim",
-  {
-    description: "Validate coverage, prior-auth requirement, documentation requirements, and denial risk for CPT/HCPCS procedure codes.",
-    inputSchema: {
-      procedure_codes: z.array(z.string()).min(1).max(10).describe("CPT/HCPCS procedure codes"),
-      payer: z.string().optional().describe("Payer or policy source label"),
-      plan_type: z.enum(["commercial", "medicare_advantage", "medicaid", "traditional_medicare", "exchange"]).optional(),
-      line_of_business: z.string().optional(),
-      diagnosis_codes: z.array(z.string()).max(20).optional(),
-      modifiers: z.array(z.string()).max(5).optional(),
-      state: z.string().length(2).optional(),
-      date_of_service: z
-        .string()
-        .regex(/^\d{4}-\d{2}-\d{2}$/)
-        .optional(),
-      site_of_service: z.enum(["office", "outpatient_hospital", "asc", "inpatient", "home", "telehealth"]).optional(),
-      provider_specialty: z.string().optional(),
-      age_category: z.enum(["pediatric", "adult", "medicare_age"]).optional(),
-      sex_when_policy_relevant: z.enum(["female", "male", "other", "unknown"]).optional(),
-      idempotency_key: z.string().optional(),
-      legacy: z.boolean().default(false).describe("Use deprecated /claim-validation endpoint"),
-    },
-  },
-  async ({ idempotency_key, legacy, ...body }) => {
-    try {
-      const result = await verityRequest<any>(legacy ? "/claim-validation" : "/claims/validate", {
-        method: "POST",
-        body,
-        headers: idempotency_key ? { "X-Idempotency-Key": idempotency_key } : undefined,
-      });
-      return { content: [{ type: "text", text: formatClaimValidation(result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("validate claim", error) }] };
-    }
-  }
-);
-
-// 12. research_prior_auth - AI web research
-server.registerTool(
-  "research_prior_auth",
-  {
-    description: "Research prior authorization requirements directly from payer websites. Supports async mode or sync completion.",
-    inputSchema: {
-      procedure_codes: z.array(z.string()).min(1).max(10),
-      payer: z.string().optional(),
-      state: z.string().length(2).optional(),
-      diagnosis_codes: z.array(z.string()).optional(),
-      clinical_context: z.string().max(2000).optional(),
-      sync: z.boolean().default(false),
-    },
-  },
-  async (body) => {
-    try {
-      const result = await verityRequest<any>("/prior-auth/research", { method: "POST", body });
-      return { content: [{ type: "text", text: formatResearch(result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("research prior auth", error) }] };
-    }
-  }
-);
-
-// 13. get_prior_auth_research - Poll research task
-server.registerTool(
-  "get_prior_auth_research",
-  {
-    description: "Get status and results for a prior authorization research task.",
-    inputSchema: {
-      research_id: z.string().min(1),
-    },
-  },
-  async ({ research_id }) => {
-    try {
-      const result = await verityRequest<any>(`/prior-auth/research/${encodeURIComponent(research_id)}`);
-      return { content: [{ type: "text", text: formatResearch(result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("get research status", error) }] };
-    }
-  }
-);
-
-// 14. batch_lookup_codes - Batch medical code lookup
-server.registerTool(
-  "batch_lookup_codes",
-  {
-    description: "Look up multiple medical codes in one request. Individual misses return found=false instead of failing the whole batch.",
-    inputSchema: {
-      codes: z.array(z.string()).min(1).max(50),
-      code_system: z.enum(["CPT", "HCPCS", "ICD10CM", "ICD10PCS", "NDC"]).optional(),
-      include: includeSchema.describe("Includes as an array or comma string, e.g. ['rvu', 'policies']"),
-    },
-  },
-  async (body) => {
-    try {
-      const result = await verityRequest<any>("/codes/batch", {
-        method: "POST",
-        body: { ...body, include: normalizeInclude(body.include) },
-      });
-      return { content: [{ type: "text", text: formatBatchLookup(result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("batch look up codes", error) }] };
-    }
-  }
-);
-
-// 15. evaluate_coverage - Evaluate policy criteria
-server.registerTool(
-  "evaluate_coverage",
-  {
-    description: "Evaluate a policy's coverage criteria against patient or claim parameters.",
-    inputSchema: {
-      policy_id: z.string().min(1),
-      parameters: z.record(z.unknown()),
-    },
-  },
-  async (body) => {
-    try {
-      const result = await verityRequest<any>("/coverage/evaluate", { method: "POST", body });
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("evaluate coverage", error) }] };
-    }
-  }
-);
-
-// 16. list_webhooks - Enterprise webhook endpoints
-server.registerTool(
-  "list_webhooks",
-  {
-    description: "List webhook endpoints for the authenticated organization.",
-    inputSchema: {},
-  },
-  async () => {
-    try {
-      const result = await verityRequest<any>("/webhooks");
-      return { content: [{ type: "text", text: formatWebhookList(result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("list webhooks", error) }] };
-    }
-  }
-);
-
-// 17. create_webhook - Create webhook endpoint
-server.registerTool(
-  "create_webhook",
-  {
-    description: "Create a webhook endpoint. Returns the webhook secret once.",
-    inputSchema: {
-      url: z.string().url().refine((value) => new URL(value).protocol === "https:", "Webhook URL must use HTTPS"),
-      events: z.array(z.string()).min(1),
-    },
-  },
-  async (body) => {
-    try {
-      const result = await verityRequest<any>("/webhooks", { method: "POST", body });
-      return { content: [{ type: "text", text: formatMutationResult("Create webhook", result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("create webhook", error) }] };
-    }
-  }
-);
-
-// 18. update_webhook - Update webhook endpoint
-server.registerTool(
-  "update_webhook",
-  {
-    description: "Update a webhook endpoint URL, events, or status.",
-    inputSchema: {
-      id: z.number().int(),
-      url: z.string().url().refine((value) => new URL(value).protocol === "https:", "Webhook URL must use HTTPS").optional(),
-      events: z.array(z.string()).optional(),
-      status: z.enum(["active", "paused"]).optional(),
-    },
-  },
-  async ({ id, url, events, status }) => {
-    try {
-      const result = await verityRequest<any>(`/webhooks/${id}`, {
-        method: "PATCH",
-        body: { url, events, status },
-      });
-      return { content: [{ type: "text", text: formatMutationResult("Update webhook", result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("update webhook", error) }] };
-    }
-  }
-);
-
-// 19. delete_webhook - Delete webhook endpoint
-server.registerTool(
-  "delete_webhook",
-  {
-    description: "Delete a webhook endpoint.",
-    inputSchema: {
-      id: z.number().int(),
-    },
-  },
-  async ({ id }) => {
-    try {
-      const result = await verityRequest<any>(`/webhooks/${id}`, { method: "DELETE" });
-      return { content: [{ type: "text", text: formatMutationResult("Delete webhook", result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("delete webhook", error) }] };
-    }
-  }
-);
-
-// 20. test_webhook - Send test webhook event
-server.registerTool(
-  "test_webhook",
-  {
-    description: "Send a test event to a webhook endpoint.",
-    inputSchema: {
-      id: z.number().int(),
-    },
-  },
-  async ({ id }) => {
-    try {
-      const result = await verityRequest<any>(`/webhooks/${id}/test`, { method: "POST" });
-      return { content: [{ type: "text", text: formatMutationResult("Test webhook", result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("test webhook", error) }] };
-    }
-  }
-);
-
-// 21. list_unreviewed_changes - Compliance changes
-server.registerTool(
-  "list_unreviewed_changes",
-  {
-    description: "List policy changes not yet acknowledged by the authenticated organization.",
-    inputSchema: {
-      change_type: z.string().optional(),
-      cursor: z.string().optional(),
-      limit: z.number().int().min(1).max(100).default(50),
-    },
-  },
-  async ({ change_type, cursor, limit }) => {
-    try {
-      const result = await verityRequest<any>("/compliance/unreviewed", {
-        params: { change_type, cursor, limit },
-      });
-      return { content: [{ type: "text", text: formatJson({ data: result.data, meta: result.meta }) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("list unreviewed changes", error) }] };
-    }
-  }
-);
-
-// 22. acknowledge_change - Acknowledge one compliance change
-server.registerTool(
-  "acknowledge_change",
-  {
-    description: "Acknowledge a single policy change.",
-    inputSchema: {
-      diff_id: z.number().int(),
-      notes: z.string().max(500).optional(),
-    },
-  },
-  async (body) => {
-    try {
-      const result = await verityRequest<any>("/compliance/ack", { method: "POST", body });
-      return { content: [{ type: "text", text: formatMutationResult("Acknowledge policy change", result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("acknowledge change", error) }] };
-    }
-  }
-);
-
-// 23. bulk_acknowledge_changes - Acknowledge many compliance changes
-server.registerTool(
-  "bulk_acknowledge_changes",
-  {
-    description: "Acknowledge multiple policy changes.",
-    inputSchema: {
-      diff_ids: z.array(z.number().int()).min(1).max(200),
-      notes: z.string().max(500).optional(),
-    },
-  },
-  async (body) => {
-    try {
-      const result = await verityRequest<any>("/compliance/ack/bulk", { method: "POST", body });
-      return { content: [{ type: "text", text: formatMutationResult("Bulk acknowledge policy changes", result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("bulk acknowledge changes", error) }] };
-    }
-  }
-);
-
-// 24. get_compliance_stats - Compliance dashboard stats
-server.registerTool(
-  "get_compliance_stats",
-  {
-    description: "Get compliance dashboard statistics for the authenticated organization.",
-    inputSchema: {},
-  },
-  async () => {
-    try {
-      const result = await verityRequest<any>("/compliance/stats");
-      return { content: [{ type: "text", text: formatComplianceStats(result.data) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("get compliance stats", error) }] };
-    }
-  }
-);
-
-// 25. search_drug_formulary_evidence - Drug formulary evidence
-server.registerTool(
-  "search_drug_formulary_evidence",
-  {
-    description: "Search commercial pharmacy-benefit evidence from CVS Caremark, Express Scripts, and UnitedHealthcare / Optum Rx.",
-    inputSchema: {
-      query: z.string().min(2).max(200),
-      payer: z.enum(["all", "cvs_caremark", "express_scripts", "uhc"]).default("all"),
-      limit: z.number().int().min(1).max(100).default(25),
-    },
-  },
-  async ({ query, payer, limit }) => {
-    try {
-      const result = await verityRequest<any>("/drugs/formulary", {
-        params: { q: query, payer, limit },
-      });
-      return { content: [{ type: "text", text: formatDrugFormulary(result.data, query, result.meta) }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: formatToolError("search drug formulary", error) }] };
-    }
-  }
-);
+registerWorkflowTools(registerTool);
 
 return server;
 }

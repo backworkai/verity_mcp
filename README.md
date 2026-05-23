@@ -150,33 +150,32 @@ Requires Node.js 18 or newer.
 
 ## Available Tools
 
-| Tool | Purpose |
+Tool names use the `verity_` prefix for discoverability when this server is installed alongside other MCP servers. The default surface is intentionally workflow-level rather than a 1:1 API wrapper, so agents see fewer choices and common tasks require fewer tool calls.
+
+All tools include `title`, `description`, `inputSchema`, `outputSchema`, and MCP annotations. Successful calls return readable text plus `structuredContent` with `message`, and when available, raw Verity API `data` and `meta`. Tool-level failures return `isError: true`.
+
+| Primary tool | Purpose |
 | --- | --- |
-| `lookup_code` | Look up a medical code with optional RVU, policy, and rate data |
-| `search_policies` | Search Medicare coverage policies |
-| `get_policy` | Retrieve a policy by ID |
-| `compare_policies` | Compare policy coverage across MAC jurisdictions |
-| `get_policy_changes` | Track policy changes over time |
-| `search_criteria` | Search extracted coverage criteria blocks |
-| `list_jurisdictions` | List MAC jurisdictions and covered states |
-| `check_prior_auth` | Check prior authorization requirements |
-| `get_health` | Check Verity API health |
-| `get_spending_by_code` | Retrieve Medicaid spending data by HCPCS code |
-| `validate_claim` | Validate claim coverage and denial risk |
-| `research_prior_auth` | Research payer prior authorization requirements |
-| `get_prior_auth_research` | Poll a prior authorization research task |
-| `batch_lookup_codes` | Look up multiple codes in one request |
-| `evaluate_coverage` | Evaluate policy criteria against structured inputs |
-| `list_webhooks` | List webhook endpoints |
-| `create_webhook` | Create a webhook endpoint |
-| `update_webhook` | Update a webhook endpoint |
-| `delete_webhook` | Delete a webhook endpoint |
-| `test_webhook` | Send a test webhook event |
-| `list_unreviewed_changes` | List policy changes awaiting review |
-| `acknowledge_change` | Acknowledge one policy change |
-| `bulk_acknowledge_changes` | Acknowledge multiple policy changes |
-| `get_compliance_stats` | Get compliance dashboard statistics |
-| `search_drug_formulary_evidence` | Search commercial drug formulary evidence |
+| `verity_coverage_lookup` | Look up procedure codes and combine code details, policy evidence, prior authorization, claim risk, jurisdiction comparison, and spending evidence |
+| `verity_policy_research` | Search policies, fetch one policy, search extracted criteria, review policy changes, or map MAC jurisdictions |
+| `verity_claim_validation` | Validate claim coverage, documentation requirements, denial risk, and optional policy-specific criteria |
+| `verity_prior_auth_research` | Check Medicare prior authorization, start payer website research, or poll an async research task |
+| `verity_drug_formulary_research` | Search commercial pharmacy-benefit evidence from CVS Caremark, Express Scripts, and UnitedHealthcare / Optum Rx |
+| `verity_compliance_review` | Review compliance stats, list unreviewed policy changes, or acknowledge changes |
+| `verity_webhook_management` | List, create, update, delete, or test webhook endpoints |
+| `verity_system_health` | Check Verity API health and dependency status |
+
+### Response Format
+
+Every tool accepts:
+
+```json
+{
+  "response_format": "markdown"
+}
+```
+
+Use `"markdown"` for readable output or `"json"` to make the text content mirror the returned `structuredContent`.
 
 ## Example Prompts
 
@@ -195,6 +194,27 @@ Validate denial risk for 99213 with diagnosis E11.9 for Medicare in Texas.
 ```text
 Search formulary evidence for Ozempic across commercial PBMs.
 ```
+
+## Testing and Evaluations
+
+Run the build and MCP metadata smoke test:
+
+```bash
+npm test
+```
+
+The smoke test starts the built stdio server with a dummy key, verifies the 8 workflow tools, checks titles, schemas, annotations, output schemas, `response_format`, and verifies local validation failures are reported with `isError: true`.
+
+The `evals/` directory includes a tool-discoverability evaluation and a read-only data evaluation built from fixed source-backed policy/code records. Refresh the read-only answers intentionally when Verity source data is updated.
+
+## Release
+
+The package publishes to npm as `verity-mcp`.
+
+1. Configure npm Trusted Publishing for `backworkai/verity_mcp`, workflow `release.yml`, package `verity-mcp`.
+2. Update `package.json` and `package-lock.json` to the new version.
+3. Push a matching tag, for example `v1.1.0`.
+4. The release workflow installs with `npm ci`, runs the build/smoke test, verifies `npm pack --dry-run`, and publishes with npm provenance.
 
 ## Environment Variables
 
