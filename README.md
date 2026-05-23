@@ -25,8 +25,7 @@ codex mcp add verity --url https://mcp.verity.backworkai.com/mcp --bearer-token-
 For local stdio:
 
 ```bash
-export VERITY_API_KEY=vrt_live_YOUR_API_KEY
-codex mcp add verity -- npx -y github:backworkai/verity_mcp
+codex mcp add verity --env VERITY_API_KEY=vrt_live_YOUR_API_KEY -- npx -y github:backworkai/verity_mcp
 ```
 
 ## Claude Code
@@ -38,11 +37,12 @@ export VERITY_API_KEY=vrt_live_YOUR_API_KEY
 claude mcp add --transport http verity https://mcp.verity.backworkai.com/mcp --header "Authorization: Bearer $VERITY_API_KEY"
 ```
 
+Claude stores HTTP headers in its MCP config. Use a scoped Verity key and rotate it if you later remove this server.
+
 For local stdio:
 
 ```bash
-export VERITY_API_KEY=vrt_live_YOUR_API_KEY
-claude mcp add verity -- npx -y github:backworkai/verity_mcp
+claude mcp add -e VERITY_API_KEY=vrt_live_YOUR_API_KEY verity -- npx -y github:backworkai/verity_mcp
 ```
 
 ## Cursor, VS Code, Windsurf, and Other MCP Clients
@@ -63,7 +63,7 @@ For clients that only support stdio commands:
 }
 ```
 
-For clients that support remote URLs and headers:
+For clients that support remote URLs and headers, set the bearer header using the client's documented secret or environment mechanism. If the client only accepts static JSON, replace the placeholder directly:
 
 ```json
 {
@@ -71,7 +71,7 @@ For clients that support remote URLs and headers:
     "verity": {
       "url": "https://mcp.verity.backworkai.com/mcp",
       "headers": {
-        "Authorization": "Bearer ${VERITY_API_KEY}"
+        "Authorization": "Bearer vrt_live_YOUR_API_KEY"
       }
     }
   }
