@@ -100,7 +100,18 @@ Defaults:
 | MCP path | `/mcp` | `--path` or `VERITY_MCP_PATH` |
 | Allowed hosts | loopback/private hosts, `VERCEL_URL`, or configured public host | `VERITY_MCP_ALLOWED_HOSTS` or `VERITY_MCP_PUBLIC_HOST` |
 
-HTTP mode requires `Authorization: Bearer <Verity API key>` per request by default. For a private single-tenant deployment where the server environment supplies the key, set:
+HTTP mode requires `Authorization: Bearer` per request. By default this bearer is a Verity API key for backward compatibility. For hosted remote MCP deployments, enable OAuth protected-resource discovery so Claude-compatible clients can authenticate users through your authorization server:
+
+```bash
+VERITY_MCP_AUTH_MODE=oauth \
+VERITY_MCP_OAUTH_AUTHORIZATION_SERVERS=https://auth.example.com \
+VERITY_MCP_OAUTH_SCOPES=verity:mcp \
+npm run start:http
+```
+
+The server publishes OAuth Protected Resource Metadata at `/.well-known/oauth-protected-resource` and includes that URL in `WWW-Authenticate` challenges. If your Verity API accepts OAuth access tokens directly, no extra mapping is needed; the MCP server forwards the OAuth bearer downstream. If your authorization server exposes a Verity API key in token introspection, set `VERITY_MCP_OAUTH_INTROSPECTION_URL` and `VERITY_MCP_OAUTH_API_KEY_CLAIM` to validate the access token and map it to the downstream Verity credential.
+
+For a private single-tenant deployment where the server environment supplies the key, set:
 
 ```bash
 VERITY_MCP_ALLOW_ENV_KEY=true VERITY_API_KEY=vrt_live_YOUR_API_KEY npm run start:http
@@ -114,6 +125,7 @@ This repo can deploy as an API-only Vercel project. The production project uses:
 
 ```bash
 VERITY_MCP_PUBLIC_HOST=mcp.verity.backworkai.com
+VERITY_MCP_PUBLIC_URL=https://mcp.verity.backworkai.com
 VERITY_MCP_ALLOWED_HOSTS=mcp.verity.backworkai.com,verity-mcp.vercel.app
 ```
 
@@ -123,6 +135,7 @@ The Vercel functions expose:
 | --- | --- |
 | `/mcp` | Streamable HTTP MCP endpoint |
 | `/health` | Lightweight MCP server health check |
+| `/.well-known/oauth-protected-resource` | OAuth protected-resource metadata when OAuth is configured |
 | `/` | Basic endpoint metadata |
 
 Health check:
@@ -211,7 +224,7 @@ The `evals/` directory includes a tool-discoverability evaluation and a read-onl
 
 The package publishes to npm as `verity-mcp`.
 
-1. Configure npm Trusted Publishing for `backworkai/verity_mcp`, workflow `release.yml`, package `verity-mcp`.
+1. Configure npm Trusted Publishing for `backworkai/verity_mcp`, workflow `release.yml`, environment `npm`, package `verity-mcp`.
 2. Update `package.json` and `package-lock.json` to the new version.
 3. Push a matching tag, for example `v1.1.0`.
 4. The release workflow installs with `npm ci`, runs the build/smoke test, verifies `npm pack --dry-run`, and publishes with npm provenance.
@@ -231,17 +244,29 @@ The package publishes to npm as `verity-mcp`.
 | `VERITY_MCP_ALLOWED_HOSTS` | No | Comma-separated allowed HTTP Host headers for public deployments. |
 | `VERITY_MCP_ALLOW_HOST` | No | Backward-compatible alias for `VERITY_MCP_ALLOWED_HOSTS`. |
 | `VERITY_MCP_PUBLIC_HOST` | No | Primary public host allowed for HTTP requests. |
+| `VERITY_MCP_PUBLIC_URL` | No | Canonical public origin for OAuth metadata, e.g. `https://mcp.verity.backworkai.com`. |
 | `VERITY_MCP_ALLOW_ENV_KEY` | No | Allow private HTTP requests without bearer auth to use `VERITY_API_KEY`. |
+| `VERITY_MCP_AUTH_MODE` | No | HTTP bearer mode: `api-key`, `oauth`, or `dual`. Defaults to `dual` when OAuth authorization servers are configured, otherwise `api-key`. |
+| `VERITY_MCP_OAUTH_AUTHORIZATION_SERVERS` | OAuth | Comma-separated OAuth issuer / authorization server URLs advertised in protected-resource metadata. |
+| `VERITY_MCP_OAUTH_RESOURCE` | No | Override the RFC 8707 resource identifier. Defaults to the public MCP URL. |
+| `VERITY_MCP_OAUTH_SCOPES` | No | Space- or comma-separated scopes advertised to clients. Defaults to `verity:mcp`. |
+| `VERITY_MCP_OAUTH_REQUIRED_SCOPES` | No | Space- or comma-separated scopes required after token introspection. |
+| `VERITY_MCP_OAUTH_INTROSPECTION_URL` | No | RFC 7662 token introspection endpoint used to validate OAuth access tokens. |
+| `VERITY_MCP_OAUTH_INTROSPECTION_CLIENT_ID` | No | Client ID for introspection basic auth. |
+| `VERITY_MCP_OAUTH_INTROSPECTION_CLIENT_SECRET` | No | Client secret for introspection basic auth. |
+| `VERITY_MCP_OAUTH_INTROSPECTION_TOKEN` | No | Bearer token for introspection when basic auth is not used. |
+| `VERITY_MCP_OAUTH_API_KEY_CLAIM` | No | Dot-path claim from introspection response to use as the downstream Verity credential. If omitted, the OAuth access token is forwarded. |
+| `VERITY_MCP_OAUTH_EXPECTED_AUDIENCE` | No | Comma-separated allowed `aud` values when introspection responses include an audience. |
 
 ## Troubleshooting
 
 ### Missing API Key
 
-For stdio, set `VERITY_API_KEY` in the MCP client configuration. For HTTP, send `Authorization: Bearer <key>`.
+For stdio, set `VERITY_API_KEY` in the MCP client configuration. For HTTP API-key mode, send `Authorization: Bearer <key>`. For HTTP OAuth mode, configure `VERITY_MCP_OAUTH_AUTHORIZATION_SERVERS` and send `Authorization: Bearer <access_token>`.
 
 ### 401 From HTTP MCP
 
-The remote server did not receive a bearer token. Configure your MCP client to send an `Authorization` header or use a client option such as Codex `--bearer-token-env-var`.
+The remote server did not receive a bearer token. Configure your MCP client to authenticate with OAuth or send an `Authorization` header. OAuth-enabled deployments include `resource_metadata` in the `WWW-Authenticate` header to point clients at `/.well-known/oauth-protected-resource`.
 
 ### Rate Limits
 
