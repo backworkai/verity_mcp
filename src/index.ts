@@ -236,7 +236,8 @@ function formatJson(value: unknown): string {
 function formatClaimValidation(result: any): string {
   const lines: string[] = [];
   lines.push(`Coverage Status: ${result.coverage_status}`);
-  lines.push(`Prior Auth Required: ${result.prior_auth_required ? "YES" : "NO"}`);
+  const paRequired = result.prior_auth_required === true ? "YES" : result.prior_auth_required === false ? "NO" : "UNKNOWN";
+  lines.push(`Prior Auth Required: ${paRequired}`);
   lines.push(`Denial Risk: ${result.denial_risk}`);
   lines.push(`Overall Risk: ${result.overall_risk}`);
   lines.push(`Confidence: ${result.confidence}`);
@@ -251,10 +252,26 @@ function formatClaimValidation(result: any): string {
     result.known_gaps.forEach((item: string) => lines.push(`- ${item}`));
   }
 
+  if (result.issues?.length > 0) {
+    lines.push("\n--- Issues ---");
+    result.issues.forEach((item: string) => lines.push(`- ${item}`));
+  }
+
+  const matchedPolicies = result.matched_policies ?? [];
+  if (matchedPolicies.length > 0) {
+    lines.push("\n--- Matched Policies ---");
+    matchedPolicies.slice(0, 5).forEach((policy: any) => {
+      const jurisdiction = policy.jurisdiction ? ` (${policy.jurisdiction})` : "";
+      lines.push(`- ${policy.policy_id}: ${policy.title}${jurisdiction}`);
+    });
+    if (matchedPolicies.length > 5) lines.push(`... and ${matchedPolicies.length - 5} more policies`);
+  }
+
   if (result.codes?.length > 0) {
     lines.push("\n--- Code-Level Results ---");
     result.codes.forEach((code: any) => {
-      lines.push(`${code.code}: ${code.coverage_status}, PA: ${code.prior_auth_required ? "yes" : "no"}, risk: ${code.denial_risk}`);
+      const codePa = code.prior_auth_required === true ? "yes" : code.prior_auth_required === false ? "no" : "unknown";
+      lines.push(`${code.code}: ${code.coverage_status}, PA: ${codePa}, risk: ${code.denial_risk}`);
       if (code.issues?.length) lines.push(`  Issues: ${code.issues.join("; ")}`);
     });
   }
@@ -649,8 +666,13 @@ Examples:
       const lines: string[] = [`Found ${result.data.length} matching criteria:\n`];
 
       result.data.forEach((criteria: any, i: number) => {
-        lines.push(`${i + 1}. [${criteria.section.toUpperCase()}] from ${criteria.policy.policy_id}`);
-        lines.push(`   Policy: ${criteria.policy.title}`);
+        const policyId = criteria.policy_id ?? criteria.policy?.policy_id ?? "unknown policy";
+        const policyTitle = criteria.policy_title ?? criteria.policy?.title ?? "Untitled policy";
+        const policyType = criteria.policy_type ?? criteria.policy?.policy_type;
+        const jurisdiction = criteria.jurisdiction ?? criteria.policy?.jurisdiction;
+        const context = [policyType, jurisdiction].filter(Boolean).join(" / ");
+        lines.push(`${i + 1}. [${criteria.section.toUpperCase()}] from ${policyId}`);
+        lines.push(`   Policy: ${policyTitle}${context ? ` (${context})` : ""}`);
         lines.push(`   Text: ${criteria.text.slice(0, 300)}${criteria.text.length > 300 ? "..." : ""}`);
         if (criteria.tags?.length) lines.push(`   Tags: ${criteria.tags.join(", ")}`);
         if (criteria.requires_manual_review) lines.push(`   Note: Requires manual review`);
@@ -817,6 +839,10 @@ server.registerTool(
       diagnosis_codes: z.array(z.string()).max(20).optional(),
       modifiers: z.array(z.string()).max(5).optional(),
       state: z.string().length(2).optional(),
+      date_of_service: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/)
+        .optional(),
       site_of_service: z.enum(["office", "outpatient_hospital", "asc", "inpatient", "home", "telehealth"]).optional(),
       provider_specialty: z.string().optional(),
       age_category: z.enum(["pediatric", "adult", "medicare_age"]).optional(),
