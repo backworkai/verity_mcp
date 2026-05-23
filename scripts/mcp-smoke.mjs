@@ -51,11 +51,11 @@ try {
   assert.equal(byName.get("verity_webhook_management")?.annotations?.readOnlyHint, false);
   assert.equal(byName.get("verity_webhook_management")?.annotations?.destructiveHint, true);
 
-  const invalidSpendingCall = await client.callTool({
+  const invalidPolicyCall = await client.callTool({
     name: "verity_policy_research",
     arguments: { action: "get", response_format: "json" },
   });
-  assert.equal(invalidSpendingCall.isError, true, "local validation errors should be tool errors");
+  assert.equal(invalidPolicyCall.isError, true, "local validation errors should be tool errors");
 
   console.log(`MCP smoke test passed: ${tools.length} tools verified.`);
 } finally {

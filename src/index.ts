@@ -56,7 +56,6 @@ const mutatingTools = new Set([
 ]);
 
 const destructiveTools = new Set(["webhook_management"]);
-const idempotentMutationTools = new Set(["compliance_review"]);
 
 const toolTitles: Record<string, string> = {
   coverage_lookup: "Coverage Lookup",
@@ -590,7 +589,7 @@ function toolAnnotations(name: string): ToolAnnotations {
   return {
     readOnlyHint: readOnly,
     destructiveHint: destructiveTools.has(name),
-    idempotentHint: readOnly || idempotentMutationTools.has(name),
+    idempotentHint: readOnly,
     openWorldHint: true,
   };
 }
@@ -610,10 +609,6 @@ function textFromToolResult(result: CallToolResult): string {
     .join("\n");
 }
 
-function isErrorText(text: string): boolean {
-  return /^(error|cannot|failed)\b/i.test(text.trim());
-}
-
 function splitResponseFormat(args: unknown): { handlerArgs: unknown; responseFormat: ResponseFormat } {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
     return { handlerArgs: args, responseFormat: "markdown" };
@@ -628,9 +623,8 @@ function splitResponseFormat(args: unknown): { handlerArgs: unknown; responseFor
 
 function normalizeToolResult(result: CallToolResult, responseFormat: ResponseFormat): CallToolResult {
   const text = textFromToolResult(result);
-  const isError = result.isError === true || isErrorText(text);
 
-  if (isError) {
+  if (result.isError === true) {
     return {
       ...result,
       isError: true,
@@ -653,6 +647,14 @@ function normalizeToolResult(result: CallToolResult, responseFormat: ResponseFor
   };
 }
 
+function errorResult(message: string): CallToolResult {
+  return {
+    content: [{ type: "text", text: message }],
+    structuredContent: { message },
+    isError: true,
+  };
+}
+
 function toolResult(message: string, data?: unknown, meta?: unknown): CallToolResult {
   return {
     content: [{ type: "text", text: message }],
@@ -665,10 +667,7 @@ function toolResult(message: string, data?: unknown, meta?: unknown): CallToolRe
 }
 
 function toolError(message: string): CallToolResult {
-  return {
-    content: [{ type: "text", text: `Error: ${message}` }],
-    isError: true,
-  };
+  return errorResult(`Error: ${message}`);
 }
 
 function enhanceDescription(name: string, description: string | undefined): string {
@@ -698,15 +697,7 @@ function wrapToolHandler(name: string, handler: VerityToolHandler): VerityToolHa
     try {
       return normalizeToolResult(await handler(handlerArgs, extra), responseFormat);
     } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error running ${name}: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-        isError: true,
-      };
+      return errorResult(`Error running ${name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 }
@@ -1121,13 +1112,14 @@ This tool can combine code lookup, related policy evidence, Medicare prior-auth 
             body: { procedure_codes, jurisdictions: compare_jurisdictions },
           });
           data.jurisdiction_compare = result.data;
-          const summary = result.data.summary;
+          const comparison = Array.isArray(result.data?.comparison) ? result.data.comparison : [];
+          const summary = result.data?.summary ?? {};
           lines.push("\n--- Jurisdiction Comparison ---");
-          lines.push(`Jurisdictions analyzed: ${summary.total_jurisdictions}`);
-          lines.push(`With coverage: ${summary.jurisdictions_with_coverage}`);
-          lines.push(`Regional variation: ${summary.has_variation ? "YES" : "NO"}`);
-          if (result.data.comparison?.length) {
-            result.data.comparison.slice(0, 8).forEach((jur: any) => {
+          lines.push(`Jurisdictions analyzed: ${summary.total_jurisdictions ?? comparison.length}`);
+          lines.push(`With coverage: ${summary.jurisdictions_with_coverage ?? "unknown"}`);
+          lines.push(`Regional variation: ${summary.has_variation === undefined ? "unknown" : summary.has_variation ? "YES" : "NO"}`);
+          if (comparison.length) {
+            comparison.slice(0, 8).forEach((jur: any) => {
               lines.push(`- ${jur.jurisdiction}: ${jur.coverage_summary ? JSON.stringify(jur.coverage_summary) : "no summary"}`);
             });
           }
@@ -1144,7 +1136,7 @@ This tool can combine code lookup, related policy evidence, Medicare prior-auth 
 
         return toolResult(lines.join("\n"), data);
       } catch (error) {
-        return { content: [{ type: "text", text: formatToolError("run coverage lookup", error) }] };
+        return errorResult(formatToolError("run coverage lookup", error));
       }
     },
   );
@@ -1235,7 +1227,7 @@ Use this for policy search, fetching one policy by ID, searching extracted crite
         });
         return toolResult(lines.join("\n"), result.data, result.meta);
       } catch (error) {
-        return { content: [{ type: "text", text: formatToolError("research policies", error) }] };
+        return errorResult(formatToolError("research policies", error));
       }
     },
   );
@@ -1286,7 +1278,7 @@ Use this for policy search, fetching one policy by ID, searching extracted crite
 
         return toolResult(lines.join("\n"), data);
       } catch (error) {
-        return { content: [{ type: "text", text: formatToolError("validate claim", error) }] };
+        return errorResult(formatToolError("validate claim", error));
       }
     },
   );
@@ -1330,7 +1322,7 @@ Use this for policy search, fetching one policy by ID, searching extracted crite
         });
         return toolResult(formatResearch(result.data), result.data, result.meta);
       } catch (error) {
-        return { content: [{ type: "text", text: formatToolError("research prior auth", error) }] };
+        return errorResult(formatToolError("research prior auth", error));
       }
     },
   );
@@ -1373,7 +1365,7 @@ Use this for policy search, fetching one policy by ID, searching extracted crite
 
         return toolResult(formatDrugFormulary(result.data, query, result.meta), result.data, result.meta);
       } catch (error) {
-        return { content: [{ type: "text", text: formatToolError("search drug formulary", error) }] };
+        return errorResult(formatToolError("search drug formulary", error));
       }
     },
   );
@@ -1411,7 +1403,7 @@ Use this for policy search, fetching one policy by ID, searching extracted crite
         const result = await verityRequest<any>("/compliance/ack/bulk", { method: "POST", body: { diff_ids, notes } });
         return toolResult(formatMutationResult("Bulk acknowledge policy changes", result.data), result.data, result.meta);
       } catch (error) {
-        return { content: [{ type: "text", text: formatToolError("review compliance", error) }] };
+        return errorResult(formatToolError("review compliance", error));
       }
     },
   );
@@ -1451,7 +1443,7 @@ Use this for policy search, fetching one policy by ID, searching extracted crite
         const result = await verityRequest<any>(`/webhooks/${id}/test`, { method: "POST" });
         return toolResult(formatMutationResult("Test webhook", result.data), result.data, result.meta);
       } catch (error) {
-        return { content: [{ type: "text", text: formatToolError("manage webhooks", error) }] };
+        return errorResult(formatToolError("manage webhooks", error));
       }
     },
   );
@@ -1467,7 +1459,7 @@ Use this for policy search, fetching one policy by ID, searching extracted crite
         const result = await verityRequest<any>("/health");
         return toolResult(formatJson(result.data), result.data, result.meta);
       } catch (error) {
-        return { content: [{ type: "text", text: formatToolError("check health", error) }] };
+        return errorResult(formatToolError("check health", error));
       }
     },
   );
