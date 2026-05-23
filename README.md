@@ -4,15 +4,14 @@ Official Model Context Protocol (MCP) server for the [Verity API](https://verity
 
 ## Current Setup
 
-The current stable setup is local stdio via `npx`:
+The fastest setup is the hosted Streamable HTTP MCP endpoint:
 
 ```bash
 export VERITY_API_KEY=vrt_live_YOUR_API_KEY
+codex mcp add verity --url https://mcp.verity.backworkai.com/mcp --bearer-token-env-var VERITY_API_KEY
 ```
 
-Then add the server to your MCP client using the client-specific examples below.
-
-Remote Streamable HTTP support is implemented in this server for self-hosting and future hosted deployment. A public Verity-hosted MCP endpoint is not live yet, so do not use `https://<your-verity-mcp-host>/mcp` until Verity publishes one.
+Use the local stdio setup when your MCP client does not support remote Streamable HTTP yet, or when you want to run the server entirely on your machine.
 
 ## Codex
 
@@ -20,30 +19,30 @@ Codex supports Streamable HTTP MCP servers and can source the bearer token from 
 
 ```bash
 export VERITY_API_KEY=vrt_live_YOUR_API_KEY
-codex mcp add verity -- npx -y github:backworkai/verity_mcp
+codex mcp add verity --url https://mcp.verity.backworkai.com/mcp --bearer-token-env-var VERITY_API_KEY
 ```
 
-For a self-hosted Streamable HTTP server:
+For local stdio:
 
 ```bash
 export VERITY_API_KEY=vrt_live_YOUR_API_KEY
-codex mcp add verity --url https://<your-verity-mcp-host>/mcp --bearer-token-env-var VERITY_API_KEY
+codex mcp add verity -- npx -y github:backworkai/verity_mcp
 ```
 
 ## Claude Code
+
+For hosted Streamable HTTP:
+
+```bash
+export VERITY_API_KEY=vrt_live_YOUR_API_KEY
+claude mcp add --transport http verity https://mcp.verity.backworkai.com/mcp --header "Authorization: Bearer $VERITY_API_KEY"
+```
 
 For local stdio:
 
 ```bash
 export VERITY_API_KEY=vrt_live_YOUR_API_KEY
 claude mcp add verity -- npx -y github:backworkai/verity_mcp
-```
-
-For a self-hosted Streamable HTTP server:
-
-```bash
-export VERITY_API_KEY=vrt_live_YOUR_API_KEY
-claude mcp add --transport http verity https://<your-verity-mcp-host>/mcp --header "Authorization: Bearer $VERITY_API_KEY"
 ```
 
 ## Cursor, VS Code, Windsurf, and Other MCP Clients
@@ -64,13 +63,13 @@ For clients that only support stdio commands:
 }
 ```
 
-For clients that support remote URLs and headers against a self-hosted server:
+For clients that support remote URLs and headers:
 
 ```json
 {
   "mcpServers": {
     "verity": {
-      "url": "https://<your-verity-mcp-host>/mcp",
+      "url": "https://mcp.verity.backworkai.com/mcp",
       "headers": {
         "Authorization": "Bearer ${VERITY_API_KEY}"
       }
@@ -99,6 +98,7 @@ Defaults:
 | Host | `127.0.0.1` | `--host` or `VERITY_MCP_HOST` |
 | Port | `3000` | `--port` or `VERITY_MCP_PORT` or `PORT` |
 | MCP path | `/mcp` | `--path` or `VERITY_MCP_PATH` |
+| Allowed hosts | loopback/private hosts, `VERCEL_URL`, or configured public host | `VERITY_MCP_ALLOWED_HOSTS` or `VERITY_MCP_PUBLIC_HOST` |
 
 HTTP mode requires `Authorization: Bearer <Verity API key>` per request by default. For a private single-tenant deployment where the server environment supplies the key, set:
 
@@ -106,7 +106,24 @@ HTTP mode requires `Authorization: Bearer <Verity API key>` per request by defau
 VERITY_MCP_ALLOW_ENV_KEY=true VERITY_API_KEY=vrt_live_YOUR_API_KEY npm run start:http
 ```
 
-Only use `VERITY_MCP_ALLOW_ENV_KEY=true` on loopback or private-network deployments protected by network access control. Public deployments should require a bearer token per request and set `VERITY_MCP_ALLOWED_ORIGINS` to the exact client origins that may connect.
+Only use `VERITY_MCP_ALLOW_ENV_KEY=true` on loopback or private-network deployments protected by network access control. Public deployments should require a bearer token per request, set `VERITY_MCP_ALLOWED_HOSTS`/`VERITY_MCP_PUBLIC_HOST`, and set `VERITY_MCP_ALLOWED_ORIGINS` only to exact browser origins that may connect.
+
+### Vercel Hosting
+
+This repo can deploy as an API-only Vercel project. The production project uses:
+
+```bash
+VERITY_MCP_PUBLIC_HOST=mcp.verity.backworkai.com
+VERITY_MCP_ALLOWED_HOSTS=mcp.verity.backworkai.com,verity-mcp.vercel.app
+```
+
+The Vercel functions expose:
+
+| Path | Purpose |
+| --- | --- |
+| `/mcp` | Streamable HTTP MCP endpoint |
+| `/health` | Lightweight MCP server health check |
+| `/` | Basic endpoint metadata |
 
 Health check:
 
@@ -126,7 +143,7 @@ Useful commands:
 
 ```bash
 npm run start:http
-node build/index.js --help
+node build/src/index.js --help
 ```
 
 Requires Node.js 18 or newer.
@@ -191,6 +208,9 @@ Search formulary evidence for Ozempic across commercial PBMs.
 | `VERITY_MCP_PATH` | No | HTTP MCP path. |
 | `VERITY_MCP_ALLOWED_ORIGINS` | No | Comma-separated allowed HTTP origins. Loopback origins are allowed for loopback requests. |
 | `VERITY_MCP_ALLOW_ORIGIN` | No | Backward-compatible alias for `VERITY_MCP_ALLOWED_ORIGINS`. |
+| `VERITY_MCP_ALLOWED_HOSTS` | No | Comma-separated allowed HTTP Host headers for public deployments. |
+| `VERITY_MCP_ALLOW_HOST` | No | Backward-compatible alias for `VERITY_MCP_ALLOWED_HOSTS`. |
+| `VERITY_MCP_PUBLIC_HOST` | No | Primary public host allowed for HTTP requests. |
 | `VERITY_MCP_ALLOW_ENV_KEY` | No | Allow private HTTP requests without bearer auth to use `VERITY_API_KEY`. |
 
 ## Troubleshooting
