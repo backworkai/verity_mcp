@@ -224,6 +224,8 @@ The `evals/` directory includes a tool-discoverability evaluation and a read-onl
 
 The package publishes to npm as `verity-mcp`.
 
+The current public npm package is `verity-mcp@1.0.2`. This repository is prepared for the next `1.1.0` release with the workflow-oriented tool surface, hosted HTTP support, and OAuth Protected Resource Metadata.
+
 1. Configure npm Trusted Publishing for `backworkai/verity_mcp`, workflow `release.yml`, environment `npm`, package `verity-mcp`.
 2. Update `package.json` and `package-lock.json` to the new version.
 3. Push a matching tag, for example `v1.1.0`.
