@@ -25,7 +25,7 @@ codex mcp add verity --url https://mcp.verity.backworkai.com/mcp --bearer-token-
 For local stdio:
 
 ```bash
-codex mcp add verity --env VERITY_API_KEY=vrt_live_YOUR_API_KEY -- npx -y github:backworkai/verity_mcp
+codex mcp add verity --env VERITY_API_KEY=vrt_live_YOUR_API_KEY -- npx -y @backwork/verity-mcp
 ```
 
 ## Claude Code
@@ -42,7 +42,7 @@ Claude stores HTTP headers in its MCP config. Use a scoped Verity key and rotate
 For local stdio:
 
 ```bash
-claude mcp add verity -e VERITY_API_KEY=vrt_live_YOUR_API_KEY -- npx -y github:backworkai/verity_mcp
+claude mcp add verity -e VERITY_API_KEY=vrt_live_YOUR_API_KEY -- npx -y @backwork/verity-mcp
 ```
 
 ## Cursor, VS Code, Windsurf, and Other MCP Clients
@@ -54,7 +54,7 @@ For clients that only support stdio commands:
   "mcpServers": {
     "verity": {
       "command": "npx",
-      "args": ["-y", "github:backworkai/verity_mcp"],
+      "args": ["-y", "@backwork/verity-mcp"],
       "env": {
         "VERITY_API_KEY": "vrt_live_YOUR_API_KEY"
       }
@@ -222,9 +222,9 @@ The `evals/` directory includes a tool-discoverability evaluation and a read-onl
 
 ## Release
 
-The package will publish to npm as `@backwork/verity-mcp`.
+The package publishes to npm as `@backwork/verity-mcp`.
 
-The npm package is prepared to publish under the Backwork scope as `@backwork/verity-mcp`. Until that package is indexed on npm, use the GitHub `npx` install path below.
+The npm package is available under the Backwork scope as `@backwork/verity-mcp`.
 
 1. Configure npm Trusted Publishing for `backworkai/verity_mcp`, workflow `release.yml`, environment `npm`, package `@backwork/verity-mcp`.
 2. Update `package.json` and `package-lock.json` to the new version.
