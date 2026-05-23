@@ -1,25 +1,118 @@
 #!/usr/bin/env node
 
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { z } from "zod";
 
 // Configuration
 const VERITY_API_BASE = process.env.VERITY_API_BASE || "https://verity.backworkai.com/api/v1";
-const VERITY_API_KEY = process.env.VERITY_API_KEY;
+const requestApiKey = new AsyncLocalStorage<string | undefined>();
+const args = process.argv.slice(2);
+const shouldShowHelp = args.includes("--help") || args.includes("-h");
+const transportMode = (readOption("transport") || process.env.VERITY_MCP_TRANSPORT || (args.includes("--http") ? "http" : "stdio")).toLowerCase();
+const httpPath = normalizePath(readOption("path") || process.env.VERITY_MCP_PATH || "/mcp");
+const httpHost = readOption("host") || process.env.VERITY_MCP_HOST || "127.0.0.1";
+const httpPort = Number(readOption("port") || process.env.VERITY_MCP_PORT || process.env.PORT || "3000");
+const allowEnvKeyForHttp = args.includes("--allow-env-key") || process.env.VERITY_MCP_ALLOW_ENV_KEY === "true";
+const allowedOrigins = parseAllowedOrigins(process.env.VERITY_MCP_ALLOWED_ORIGINS || process.env.VERITY_MCP_ALLOW_ORIGIN);
 
-// Validate API key on startup
-if (!VERITY_API_KEY) {
-  console.error("Error: VERITY_API_KEY environment variable is required");
-  console.error("Set it with: export VERITY_API_KEY=vrt_live_YOUR_KEY_HERE");
-  process.exit(1);
-}
+type AuthenticatedIncomingMessage = IncomingMessage & { auth?: AuthInfo };
 
 // Create server instance
 const server = new McpServer({
   name: "verity",
   version: "1.0.0",
 });
+
+function readOption(name: string): string | undefined {
+  const prefix = `--${name}=`;
+  const inline = args.find((arg) => arg.startsWith(prefix));
+  if (inline) return inline.slice(prefix.length);
+
+  const index = args.indexOf(`--${name}`);
+  return index >= 0 ? args[index + 1] : undefined;
+}
+
+function normalizePath(path: string): string {
+  return path.startsWith("/") ? path : `/${path}`;
+}
+
+function printHelp(): void {
+  console.error(`Verity MCP Server
+
+Usage:
+  verity-mcp                         Start stdio transport
+  verity-mcp --http                  Start Streamable HTTP transport on /mcp
+
+Options:
+  --transport stdio|http             Transport mode (default: stdio)
+  --http                             Shortcut for --transport http
+  --host 127.0.0.1                   HTTP host (default: 127.0.0.1)
+  --port 3000                        HTTP port (default: 3000 or PORT)
+  --path /mcp                        HTTP MCP endpoint path (default: /mcp)
+  --allow-env-key                    Allow HTTP requests to use VERITY_API_KEY when no bearer token is sent
+
+Authentication:
+  stdio requires VERITY_API_KEY in the server environment.
+  http expects Authorization: Bearer <VERITY_API_KEY> on each MCP request.
+`);
+}
+
+function resolveVerityApiKey(): string {
+  const apiKey = requestApiKey.getStore() || process.env.VERITY_API_KEY;
+  if (!apiKey) {
+    throw new Error("Verity API key missing. Set VERITY_API_KEY for stdio, or send Authorization: Bearer <key> for HTTP.");
+  }
+  return apiKey;
+}
+
+function parseAllowedOrigins(value: string | undefined): Set<string> {
+  if (!value) return new Set();
+  return new Set(
+    value
+      .split(",")
+      .map((origin) => origin.trim())
+      .filter(Boolean)
+  );
+}
+
+function isLoopbackHost(host: string): boolean {
+  return host === "localhost" || host === "127.0.0.1" || host === "::1";
+}
+
+function isPrivateHost(host: string): boolean {
+  return (
+    isLoopbackHost(host) ||
+    host.startsWith("10.") ||
+    host.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+  );
+}
+
+function isAllowedOrigin(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+
+  if (allowedOrigins.has(origin)) return true;
+
+  try {
+    const parsed = new URL(origin);
+    const requestHost = (req.headers.host || "").split(":")[0];
+    return isLoopbackHost(parsed.hostname) && isLoopbackHost(requestHost);
+  } catch {
+    return false;
+  }
+}
+
+function responseOrigin(req: IncomingMessage): string {
+  const origin = req.headers.origin;
+  if (origin && isAllowedOrigin(req)) return origin;
+  return allowedOrigins.values().next().value || "null";
+}
 
 // Helper function for making Verity API requests
 async function verityRequest<T>(
@@ -44,7 +137,7 @@ async function verityRequest<T>(
   }
 
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${VERITY_API_KEY}`,
+    Authorization: `Bearer ${resolveVerityApiKey()}`,
     "Content-Type": "application/json",
     Accept: "application/json",
     ...extraHeaders,
@@ -1152,11 +1245,170 @@ server.registerTool(
   }
 );
 
-// Main entry point
-async function main() {
+function setHttpHeaders(req: IncomingMessage, res: ServerResponse): void {
+  res.setHeader("Access-Control-Allow-Origin", responseOrigin(req));
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Mcp-Session-Id, MCP-Protocol-Version");
+  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+  res.setHeader("Vary", "Origin");
+}
+
+function sendJson(req: IncomingMessage, res: ServerResponse, status: number, body: unknown): void {
+  setHttpHeaders(req, res);
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+function extractBearerToken(req: IncomingMessage): string | undefined {
+  const header = req.headers.authorization;
+  if (!header) return undefined;
+
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  return match?.[1]?.trim();
+}
+
+function resolveHttpApiKey(req: IncomingMessage): string | undefined {
+  const bearerToken = extractBearerToken(req);
+  if (bearerToken) return bearerToken;
+  if (!allowEnvKeyForHttp || !process.env.VERITY_API_KEY) return undefined;
+
+  const requestHost = (req.headers.host || "").split(":")[0];
+  return isPrivateHost(httpHost) && isPrivateHost(requestHost) ? process.env.VERITY_API_KEY : undefined;
+}
+
+async function startStdioServer(): Promise<void> {
+  if (!process.env.VERITY_API_KEY) {
+    console.error("Error: VERITY_API_KEY environment variable is required for stdio transport");
+    console.error("Set it with: export VERITY_API_KEY=vrt_live_YOUR_KEY_HERE");
+    process.exit(1);
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Verity MCP Server running on stdio");
+}
+
+async function startHttpServer(): Promise<void> {
+  if (!Number.isInteger(httpPort) || httpPort <= 0 || httpPort > 65535) {
+    throw new Error(`Invalid HTTP port: ${httpPort}`);
+  }
+
+  const httpServer = createServer(async (req, res) => {
+    setHttpHeaders(req, res);
+
+    if (req.method === "OPTIONS") {
+      if (!isAllowedOrigin(req)) {
+        sendJson(req, res, 403, {
+          error: "origin_not_allowed",
+          message: "Configure VERITY_MCP_ALLOWED_ORIGINS to allow this Origin.",
+        });
+        return;
+      }
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    if (!isAllowedOrigin(req)) {
+      sendJson(req, res, 403, {
+        error: "origin_not_allowed",
+        message: "Configure VERITY_MCP_ALLOWED_ORIGINS to allow this Origin.",
+      });
+      return;
+    }
+
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      sendJson(req, res, 200, {
+        status: "ok",
+        transport: "streamable-http",
+        mcp_path: httpPath,
+      });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/") {
+      sendJson(req, res, 200, {
+        name: "verity-mcp",
+        transport: "streamable-http",
+        mcp_url: httpPath,
+        authentication: "Send Authorization: Bearer <VERITY_API_KEY> with each MCP request.",
+      });
+      return;
+    }
+
+    if (url.pathname !== httpPath) {
+      sendJson(req, res, 404, {
+        error: "not_found",
+        message: `Use ${httpPath} for MCP Streamable HTTP requests.`,
+      });
+      return;
+    }
+
+    const apiKey = resolveHttpApiKey(req);
+    if (!apiKey) {
+      res.setHeader("WWW-Authenticate", 'Bearer realm="Verity MCP", error="invalid_token"');
+      sendJson(req, res, 401, {
+        error: "missing_bearer_token",
+        message: "Send Authorization: Bearer <VERITY_API_KEY> with the MCP request.",
+      });
+      return;
+    }
+
+    const authenticatedReq = req as AuthenticatedIncomingMessage;
+    authenticatedReq.auth = {
+      token: apiKey,
+      clientId: "verity-api-key",
+      scopes: [],
+    };
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+    });
+
+    res.on("close", () => {
+      void transport.close();
+    });
+
+    try {
+      await server.connect(transport);
+      await requestApiKey.run(apiKey, () => transport.handleRequest(authenticatedReq, res));
+    } catch (error) {
+      console.error("Error handling MCP HTTP request:", error);
+      if (!res.headersSent) {
+        sendJson(req, res, 500, {
+          error: "mcp_request_failed",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      } else {
+        res.end();
+      }
+    }
+  });
+
+  httpServer.listen(httpPort, httpHost, () => {
+    console.error(`Verity MCP Server running on Streamable HTTP: http://${httpHost}:${httpPort}${httpPath}`);
+  });
+}
+
+// Main entry point
+async function main() {
+  if (shouldShowHelp) {
+    printHelp();
+    return;
+  }
+
+  if (transportMode === "http") {
+    await startHttpServer();
+    return;
+  }
+
+  if (transportMode !== "stdio") {
+    throw new Error(`Unknown transport "${transportMode}". Use "stdio" or "http".`);
+  }
+
+  await startStdioServer();
 }
 
 main().catch((error) => {

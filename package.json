@@ -9,7 +9,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
-    "dev": "tsc --watch"
+    "start:http": "node build/index.js --http",
+    "dev": "tsc --watch",
+    "prepare": "npm run build"
   },
   "files": [
     "build"
