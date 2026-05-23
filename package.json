@@ -7,7 +7,8 @@
     "verity-mcp": "./build/src/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "clean": "node -e \"require('node:fs').rmSync('build', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc",
     "start": "node build/src/index.js",
     "start:http": "node build/src/index.js --http",
     "dev": "tsc --watch",

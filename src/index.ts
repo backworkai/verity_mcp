@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { realpathSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -1311,7 +1312,13 @@ function resolveHttpApiKey(req: IncomingMessage): string | undefined {
 
 async function readRequestBody(req: IncomingMessage): Promise<unknown> {
   const requestWithBody = req as IncomingMessage & { body?: unknown };
-  if (requestWithBody.body !== undefined) return requestWithBody.body;
+  const contentType = Array.isArray(req.headers["content-type"]) ? req.headers["content-type"].join(",") : req.headers["content-type"] || "";
+  if (requestWithBody.body !== undefined) {
+    if (typeof requestWithBody.body === "string" && contentType.toLowerCase().includes("application/json")) {
+      return JSON.parse(requestWithBody.body);
+    }
+    return requestWithBody.body;
+  }
   if (req.method !== "POST") return undefined;
 
   const chunks: Buffer[] = [];
@@ -1322,10 +1329,13 @@ async function readRequestBody(req: IncomingMessage): Promise<unknown> {
   const rawBody = Buffer.concat(chunks).toString("utf8");
   if (!rawBody.trim()) return undefined;
 
-  const contentType = Array.isArray(req.headers["content-type"]) ? req.headers["content-type"].join(",") : req.headers["content-type"] || "";
   if (!contentType.toLowerCase().includes("application/json")) return rawBody;
 
   return JSON.parse(rawBody);
+}
+
+function isInvalidJsonError(error: unknown): boolean {
+  return error instanceof SyntaxError || (error instanceof Error && error.message.toLowerCase().includes("invalid json"));
 }
 
 function rejectUnsafeHttpRequest(req: IncomingMessage, res: ServerResponse): boolean {
@@ -1412,6 +1422,15 @@ export function handleRootRequest(req: IncomingMessage, res: ServerResponse): vo
 export async function handleMcpEndpointRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (rejectUnsafeHttpRequest(req, res)) return;
 
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST, OPTIONS");
+    sendJson(req, res, 405, {
+      error: "method_not_allowed",
+      message: "Use POST for stateless Streamable HTTP MCP requests.",
+    });
+    return;
+  }
+
   const apiKey = resolveHttpApiKey(req);
   if (!apiKey) {
     res.setHeader("WWW-Authenticate", 'Bearer realm="Verity MCP", error="invalid_token"');
@@ -1443,9 +1462,11 @@ export async function handleMcpEndpointRequest(req: IncomingMessage, res: Server
     await server.connect(transport);
     await requestApiKey.run(apiKey, () => transport.handleRequest(authenticatedReq, res, body));
   } catch (error) {
-    console.error("Error handling MCP HTTP request:", error);
+    if (!isInvalidJsonError(error)) {
+      console.error("Error handling MCP HTTP request:", error);
+    }
     if (!res.headersSent) {
-      if (error instanceof SyntaxError) {
+      if (isInvalidJsonError(error)) {
         sendJson(req, res, 400, {
           error: "invalid_json",
           message: "MCP request body must be valid JSON.",
@@ -1531,8 +1552,17 @@ async function main() {
   await startStdioServer();
 }
 
+function realEntrypointUrl(path: string): string {
+  try {
+    return pathToFileURL(realpathSync(path)).href;
+  } catch {
+    return pathToFileURL(path).href;
+  }
+}
+
 const entrypoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : undefined;
-if (entrypoint === import.meta.url) {
+const realEntrypoint = process.argv[1] ? realEntrypointUrl(process.argv[1]) : undefined;
+if (entrypoint === import.meta.url || realEntrypoint === import.meta.url) {
   main().catch((error) => {
     console.error("Fatal error in main():", error);
     process.exit(1);
