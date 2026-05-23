@@ -23,6 +23,20 @@ const httpPort = Number(readOption("port") || process.env.VERITY_MCP_PORT || pro
 const allowEnvKeyForHttp = args.includes("--allow-env-key") || process.env.VERITY_MCP_ALLOW_ENV_KEY === "true";
 const allowedOrigins = parseAllowedList(process.env.VERITY_MCP_ALLOWED_ORIGINS || process.env.VERITY_MCP_ALLOW_ORIGIN);
 const allowedHosts = parseAllowedList(process.env.VERITY_MCP_ALLOWED_HOSTS || process.env.VERITY_MCP_ALLOW_HOST);
+const oauthAuthorizationServers = parseDelimitedList(
+  process.env.VERITY_MCP_OAUTH_AUTHORIZATION_SERVERS || process.env.VERITY_MCP_OAUTH_AUTHORIZATION_SERVER,
+);
+const httpAuthMode = normalizeAuthMode(readOption("auth") || process.env.VERITY_MCP_AUTH_MODE, oauthAuthorizationServers.length > 0);
+const oauthScopes = parseDelimitedList(process.env.VERITY_MCP_OAUTH_SCOPES || "verity:mcp");
+const oauthRequiredScopes = parseDelimitedList(process.env.VERITY_MCP_OAUTH_REQUIRED_SCOPES);
+const oauthIntrospectionUrl = process.env.VERITY_MCP_OAUTH_INTROSPECTION_URL;
+const oauthIntrospectionClientId = process.env.VERITY_MCP_OAUTH_INTROSPECTION_CLIENT_ID;
+const oauthIntrospectionClientSecret = process.env.VERITY_MCP_OAUTH_INTROSPECTION_CLIENT_SECRET;
+const oauthIntrospectionBearerToken = process.env.VERITY_MCP_OAUTH_INTROSPECTION_TOKEN;
+const oauthApiKeyClaim = process.env.VERITY_MCP_OAUTH_API_KEY_CLAIM;
+const oauthExpectedAudiences = parseDelimitedList(process.env.VERITY_MCP_OAUTH_EXPECTED_AUDIENCE);
+const oauthResourceOverride = process.env.VERITY_MCP_OAUTH_RESOURCE;
+const publicUrlOverride = process.env.VERITY_MCP_PUBLIC_URL;
 
 type AuthenticatedIncomingMessage = IncomingMessage & { auth?: AuthInfo };
 type VerityToolInputSchema = z.ZodRawShape;
@@ -37,6 +51,11 @@ type VerityToolConfig = {
 type VerityToolHandler = (args: any, extra: unknown) => CallToolResult | Promise<CallToolResult>;
 type RegisterVerityTool = (name: string, config: VerityToolConfig, handler: VerityToolHandler) => void;
 type ResponseFormat = "markdown" | "json";
+type HttpAuthMode = "api-key" | "oauth" | "dual";
+type HttpAuthContext = {
+  verityCredential: string;
+  authInfo: AuthInfo;
+};
 
 const responseFormatSchema = z
   .enum(["markdown", "json"])
@@ -101,6 +120,20 @@ class VerityApiError extends Error {
   }
 }
 
+class HttpAuthError extends Error {
+  status: number;
+  code: string;
+  requiredScopes?: string[];
+
+  constructor(status: number, code: string, message: string, requiredScopes?: string[]) {
+    super(message);
+    this.name = "HttpAuthError";
+    this.status = status;
+    this.code = code;
+    this.requiredScopes = requiredScopes;
+  }
+}
+
 function readOption(name: string): string | undefined {
   const prefix = `--${name}=`;
   const inline = args.find((arg) => arg.startsWith(prefix));
@@ -112,6 +145,20 @@ function readOption(name: string): string | undefined {
 
 function normalizePath(path: string): string {
   return path.startsWith("/") ? path : `/${path}`;
+}
+
+function parseDelimitedList(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(/[,\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeAuthMode(value: string | undefined, oauthConfigured: boolean): HttpAuthMode {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "api-key" || normalized === "oauth" || normalized === "dual") return normalized;
+  return oauthConfigured ? "dual" : "api-key";
 }
 
 function printHelp(): void {
@@ -127,11 +174,13 @@ Options:
   --host 127.0.0.1                   HTTP host (default: 127.0.0.1)
   --port 3000                        HTTP port (default: 3000 or PORT)
   --path /mcp                        HTTP MCP endpoint path (default: /mcp)
+  --auth api-key|oauth|dual          HTTP bearer auth mode (default: api-key, or dual when OAuth is configured)
   --allow-env-key                    Allow HTTP requests to use VERITY_API_KEY when no bearer token is sent
 
 Authentication:
   stdio requires VERITY_API_KEY in the server environment.
-  http expects Authorization: Bearer <VERITY_API_KEY> on each MCP request.
+  http expects Authorization: Bearer on each MCP request.
+  OAuth discovery is enabled when VERITY_MCP_OAUTH_AUTHORIZATION_SERVERS is set.
 `);
 }
 
@@ -213,6 +262,63 @@ function responseOrigin(req: IncomingMessage): string {
   const origin = req.headers.origin;
   if (origin && isAllowedOrigin(req)) return origin;
   return allowedOrigins.values().next().value || "null";
+}
+
+function firstHeader(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function requestOrigin(req: IncomingMessage): string {
+  if (publicUrlOverride) return new URL(publicUrlOverride).origin;
+
+  const forwardedProto = firstHeader(req.headers["x-forwarded-proto"]);
+  const forwardedHost = firstHeader(req.headers["x-forwarded-host"]);
+  const proto = forwardedProto?.split(",")[0]?.trim() || (isPrivateHost(normalizeHost(req.headers.host) || "") ? "http" : "https");
+  const host = forwardedHost?.split(",")[0]?.trim() || req.headers.host || `${httpHost}:${httpPort}`;
+  return `${proto}://${host}`;
+}
+
+function mcpResourceUrl(req: IncomingMessage): string {
+  if (oauthResourceOverride) return oauthResourceOverride;
+  return new URL(httpPath, requestOrigin(req)).toString();
+}
+
+function oauthProtectedResourceMetadataUrl(req: IncomingMessage): string {
+  return new URL("/.well-known/oauth-protected-resource", requestOrigin(req)).toString();
+}
+
+function isOAuthConfigured(): boolean {
+  return oauthAuthorizationServers.length > 0;
+}
+
+function isOAuthProtectedResourceMetadataPath(pathname: string): boolean {
+  return pathname === "/.well-known/oauth-protected-resource" || pathname === `/.well-known/oauth-protected-resource${httpPath}`;
+}
+
+function quoteAuthValue(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function bearerChallenge(req: IncomingMessage, error?: HttpAuthError): string {
+  const parts = [`realm=${quoteAuthValue("Verity MCP")}`];
+  if (error?.code) parts.push(`error=${quoteAuthValue(error.code)}`);
+  if (error?.message) parts.push(`error_description=${quoteAuthValue(error.message)}`);
+  if (isOAuthConfigured()) {
+    parts.push(`resource_metadata=${quoteAuthValue(oauthProtectedResourceMetadataUrl(req))}`);
+    const scopes = error?.requiredScopes?.length ? error.requiredScopes : oauthScopes;
+    if (scopes.length > 0) parts.push(`scope=${quoteAuthValue(scopes.join(" "))}`);
+  }
+  return `Bearer ${parts.join(", ")}`;
+}
+
+function buildProtectedResourceMetadata(req: IncomingMessage): Record<string, unknown> {
+  return {
+    resource: mcpResourceUrl(req),
+    resource_name: "Verity MCP",
+    authorization_servers: oauthAuthorizationServers,
+    bearer_methods_supported: ["header"],
+    scopes_supported: oauthScopes,
+  };
 }
 
 // Helper function for making Verity API requests
@@ -1466,15 +1572,15 @@ Use this for policy search, fetching one policy by ID, searching extracted crite
 }
 
 function createVerityMcpServer(): McpServer {
-const server = new McpServer({
-  name: "verity",
-  version: "1.1.0",
-});
-const registerTool = createVerityToolRegistrar(server);
+  const server = new McpServer({
+    name: "verity",
+    version: "1.1.0",
+  });
+  const registerTool = createVerityToolRegistrar(server);
 
-registerWorkflowTools(registerTool);
+  registerWorkflowTools(registerTool);
 
-return server;
+  return server;
 }
 
 function setHttpHeaders(req: IncomingMessage, res: ServerResponse): void {
@@ -1499,13 +1605,154 @@ function extractBearerToken(req: IncomingMessage): string | undefined {
   return match?.[1]?.trim();
 }
 
-function resolveHttpApiKey(req: IncomingMessage): string | undefined {
+function looksLikeVerityApiKey(token: string): boolean {
+  return /^vrt_(live|test)_[A-Za-z0-9_-]+$/.test(token);
+}
+
+function authInfoForApiKey(apiKey: string, clientId = "verity-api-key"): AuthInfo {
+  return {
+    token: apiKey,
+    clientId,
+    scopes: [],
+  };
+}
+
+function scopeList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  if (typeof value === "string") return value.split(/[,\s]+/).map((scope) => scope.trim()).filter(Boolean);
+  return [];
+}
+
+function claimValue(data: Record<string, unknown>, path: string): unknown {
+  return path.split(".").reduce<unknown>((current, part) => {
+    if (!current || typeof current !== "object") return undefined;
+    return (current as Record<string, unknown>)[part];
+  }, data);
+}
+
+function hasRequiredScopes(scopes: string[], requiredScopes: string[]): boolean {
+  if (requiredScopes.length === 0) return true;
+  const granted = new Set(scopes);
+  return requiredScopes.every((scope) => granted.has(scope));
+}
+
+function audienceMatches(value: unknown, expected: string[]): boolean {
+  if (expected.length === 0 || value === undefined) return true;
+  const actual = Array.isArray(value) ? value.map(String) : [String(value)];
+  return expected.some((audience) => actual.includes(audience));
+}
+
+async function introspectOAuthToken(token: string, req: IncomingMessage): Promise<Record<string, unknown>> {
+  if (!oauthIntrospectionUrl) {
+    return {};
+  }
+
+  const body = new URLSearchParams({
+    token,
+    token_type_hint: "access_token",
+    resource: mcpResourceUrl(req),
+  });
+
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "Content-Type": "application/x-www-form-urlencoded",
+  };
+
+  if (oauthIntrospectionClientId && oauthIntrospectionClientSecret) {
+    const credentials = Buffer.from(`${oauthIntrospectionClientId}:${oauthIntrospectionClientSecret}`).toString("base64");
+    headers.Authorization = `Basic ${credentials}`;
+  } else if (oauthIntrospectionBearerToken) {
+    headers.Authorization = `Bearer ${oauthIntrospectionBearerToken}`;
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(oauthIntrospectionUrl, { method: "POST", headers, body });
+  } catch (error) {
+    throw new HttpAuthError(503, "server_error", `OAuth introspection failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const text = await response.text();
+  let data: Record<string, unknown> = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new HttpAuthError(503, "server_error", "OAuth introspection returned a non-JSON response.");
+  }
+
+  if (!response.ok) {
+    throw new HttpAuthError(response.status === 401 ? 401 : 503, "invalid_token", "OAuth introspection did not accept the access token.");
+  }
+
+  return data;
+}
+
+async function validateOAuthAccessToken(token: string, req: IncomingMessage): Promise<HttpAuthContext> {
+  if (!isOAuthConfigured()) {
+    throw new HttpAuthError(500, "server_error", "OAuth auth mode requires VERITY_MCP_OAUTH_AUTHORIZATION_SERVERS.");
+  }
+
+  const tokenInfo = await introspectOAuthToken(token, req);
+  if (oauthIntrospectionUrl && tokenInfo.active !== true) {
+    throw new HttpAuthError(401, "invalid_token", "The OAuth access token is inactive, expired, or invalid.");
+  }
+
+  const scopes = scopeList(tokenInfo.scope);
+  if (!hasRequiredScopes(scopes, oauthRequiredScopes)) {
+    throw new HttpAuthError(403, "insufficient_scope", "The OAuth access token is missing required scopes.", oauthRequiredScopes);
+  }
+
+  if (!audienceMatches(tokenInfo.aud, oauthExpectedAudiences)) {
+    throw new HttpAuthError(401, "invalid_token", "The OAuth access token audience is not valid for this MCP server.");
+  }
+
+  const credentialFromClaim = oauthApiKeyClaim ? claimValue(tokenInfo, oauthApiKeyClaim) : undefined;
+  if (oauthApiKeyClaim && typeof credentialFromClaim !== "string") {
+    throw new HttpAuthError(401, "invalid_token", `OAuth token introspection did not include string claim "${oauthApiKeyClaim}".`);
+  }
+
+  const resource = new URL(mcpResourceUrl(req));
+  return {
+    verityCredential: typeof credentialFromClaim === "string" ? credentialFromClaim : token,
+    authInfo: {
+      token,
+      clientId: String(tokenInfo.client_id || tokenInfo.azp || tokenInfo.sub || "oauth-client"),
+      scopes,
+      expiresAt: typeof tokenInfo.exp === "number" ? tokenInfo.exp : undefined,
+      resource,
+      extra: {
+        auth_mode: "oauth",
+        subject: tokenInfo.sub,
+        username: tokenInfo.username,
+      },
+    },
+  };
+}
+
+async function resolveHttpAuth(req: IncomingMessage): Promise<HttpAuthContext | undefined> {
   const bearerToken = extractBearerToken(req);
-  if (bearerToken) return bearerToken;
+  if (bearerToken) {
+    if (httpAuthMode === "api-key" || (httpAuthMode === "dual" && looksLikeVerityApiKey(bearerToken))) {
+      return {
+        verityCredential: bearerToken,
+        authInfo: authInfoForApiKey(bearerToken),
+      };
+    }
+
+    return validateOAuthAccessToken(bearerToken, req);
+  }
+
   if (!allowEnvKeyForHttp || !process.env.VERITY_API_KEY) return undefined;
 
   const requestHost = normalizeHost(req.headers.host);
-  return requestHost && isPrivateHost(httpHost) && isPrivateHost(requestHost) ? process.env.VERITY_API_KEY : undefined;
+  if (requestHost && isPrivateHost(httpHost) && isPrivateHost(requestHost)) {
+    return {
+      verityCredential: process.env.VERITY_API_KEY,
+      authInfo: authInfoForApiKey(process.env.VERITY_API_KEY, "verity-env-api-key"),
+    };
+  }
+
+  return undefined;
 }
 
 async function readRequestBody(req: IncomingMessage): Promise<unknown> {
@@ -1613,8 +1860,33 @@ export function handleRootRequest(req: IncomingMessage, res: ServerResponse): vo
     name: "verity-mcp",
     transport: "streamable-http",
     mcp_url: httpPath,
-    authentication: "Send Authorization: Bearer <VERITY_API_KEY> with each MCP request.",
+    authentication: isOAuthConfigured()
+      ? "Authenticate with OAuth and send Authorization: Bearer <access_token> with each MCP request."
+      : "Send Authorization: Bearer <VERITY_API_KEY> with each MCP request.",
+    oauth_protected_resource_metadata: isOAuthConfigured() ? oauthProtectedResourceMetadataUrl(req) : undefined,
   });
+}
+
+export function handleOAuthProtectedResourceMetadataRequest(req: IncomingMessage, res: ServerResponse): void {
+  if (rejectUnsafeHttpRequest(req, res)) return;
+
+  if (req.method !== "GET") {
+    sendJson(req, res, 405, {
+      error: "method_not_allowed",
+      message: "Use GET for OAuth protected resource metadata.",
+    });
+    return;
+  }
+
+  if (!isOAuthConfigured()) {
+    sendJson(req, res, 404, {
+      error: "oauth_not_configured",
+      message: "Set VERITY_MCP_OAUTH_AUTHORIZATION_SERVERS to enable OAuth protected resource metadata.",
+    });
+    return;
+  }
+
+  sendJson(req, res, 200, buildProtectedResourceMetadata(req));
 }
 
 export async function handleMcpEndpointRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1629,22 +1901,33 @@ export async function handleMcpEndpointRequest(req: IncomingMessage, res: Server
     return;
   }
 
-  const apiKey = resolveHttpApiKey(req);
-  if (!apiKey) {
-    res.setHeader("WWW-Authenticate", 'Bearer realm="Verity MCP", error="invalid_token"');
+  let authContext: HttpAuthContext | undefined;
+  try {
+    authContext = await resolveHttpAuth(req);
+  } catch (error) {
+    if (!(error instanceof HttpAuthError)) throw error;
+    res.setHeader("WWW-Authenticate", bearerChallenge(req, error));
+    sendJson(req, res, error.status, {
+      error: error.code,
+      message: error.message,
+      ...(error.requiredScopes?.length ? { required_scopes: error.requiredScopes } : {}),
+    });
+    return;
+  }
+
+  if (!authContext) {
+    res.setHeader("WWW-Authenticate", bearerChallenge(req));
     sendJson(req, res, 401, {
       error: "missing_bearer_token",
-      message: "Send Authorization: Bearer <VERITY_API_KEY> with the MCP request.",
+      message: isOAuthConfigured()
+        ? "Authenticate with OAuth and send Authorization: Bearer <access_token> with the MCP request."
+        : "Send Authorization: Bearer <VERITY_API_KEY> with the MCP request.",
     });
     return;
   }
 
   const authenticatedReq = req as AuthenticatedIncomingMessage;
-  authenticatedReq.auth = {
-    token: apiKey,
-    clientId: "verity-api-key",
-    scopes: [],
-  };
+  authenticatedReq.auth = authContext.authInfo;
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
@@ -1658,7 +1941,7 @@ export async function handleMcpEndpointRequest(req: IncomingMessage, res: Server
     const body = await readRequestBody(authenticatedReq);
     const server = createVerityMcpServer();
     await server.connect(transport);
-    await requestApiKey.run(apiKey, () => transport.handleRequest(authenticatedReq, res, body));
+    await requestApiKey.run(authContext.verityCredential, () => transport.handleRequest(authenticatedReq, res, body));
   } catch (error) {
     if (!isInvalidJsonError(error)) {
       console.error("Error handling MCP HTTP request:", error);
@@ -1683,6 +1966,11 @@ export async function handleMcpEndpointRequest(req: IncomingMessage, res: Server
 
 export async function handleHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+  if (isOAuthProtectedResourceMetadataPath(url.pathname)) {
+    handleOAuthProtectedResourceMetadataRequest(req, res);
+    return;
+  }
 
   if (url.pathname === "/health") {
     handleHealthRequest(req, res);
