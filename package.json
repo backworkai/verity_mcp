@@ -9,6 +9,7 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('build', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc",
+    "guard:release-tag": "node -e \"const pkg=require('./package.json'); const expected='v'+pkg.version; const actual=process.env.GITHUB_REF_NAME; if (actual !== expected) { throw new Error('Release ref '+(actual || '<unset>')+' does not match package version '+expected); }\"",
     "test": "npm run build && node scripts/mcp-smoke.mjs",
     "start": "node build/src/index.js",
     "start:http": "node build/src/index.js --http",

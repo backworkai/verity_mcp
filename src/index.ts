@@ -530,7 +530,11 @@ function formatPriorAuth(result: any): string {
         if (p.codes.length > 5) lines.push(`  ... ${p.codes.length - 5} more codes omitted`);
       }
     });
-    if (remaining > 0) lines.push(`\n... ${remaining} more matched policies omitted. Use get_policy for full evidence.`);
+    if (remaining > 0) {
+      lines.push(
+        `\n... ${remaining} more matched policies omitted. Use verity_policy_research with action='get' and policy_id for full evidence.`,
+      );
+    }
   }
 
   // Documentation checklist
@@ -834,8 +838,44 @@ function formatComplianceStats(data: any): string {
   return lines.join("\n");
 }
 
+function formatComplianceChanges(data: any, meta?: any): string {
+  const changes = Array.isArray(data) ? data : [];
+  if (changes.length === 0) return "No unreviewed policy changes found.";
+
+  const lines = [`Unreviewed Policy Changes: ${changes.length}`];
+  changes.forEach((change: any, index: number) => {
+    lines.push(`\n${index + 1}. ${change.policy_id}: ${cleanText(change.policy_title, 160)}`);
+    lines.push(`   Change: ${change.change_type ?? "unknown"}${change.changed_at ? ` at ${change.changed_at}` : ""}`);
+    if (change.policy_type || change.payer_name) {
+      lines.push(`   Source: ${[change.policy_type, change.payer_name].filter(Boolean).join(" / ")}`);
+    }
+    if (change.change_summary) lines.push(`   Summary: ${cleanText(change.change_summary, 240)}`);
+    if (change.diff_id !== undefined) lines.push(`   Diff ID: ${change.diff_id}`);
+  });
+
+  const pagination = meta?.pagination;
+  if (pagination?.has_more) {
+    lines.push(`\nMore changes are available. Use cursor: "${pagination.cursor ?? pagination.next_cursor}"`);
+  }
+
+  return lines.join("\n");
+}
+
+function formularyResults(data: any): any[] {
+  return Array.isArray(data?.results) ? data.results : Array.isArray(data) ? data : [];
+}
+
+function simplifyDrugQuery(query: string): string | undefined {
+  const simplified = query
+    .replace(/\b(prior authorization|prior auth|authorization|step therapy|quantity limits?|coverage|formulary|requirements?|pa)\b/gi, " ")
+    .replace(/[()]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return simplified && simplified.toLowerCase() !== query.trim().toLowerCase() ? simplified : undefined;
+}
+
 function formatDrugFormulary(data: any, query: string, meta?: any): string {
-  const results = Array.isArray(data?.results) ? data.results : Array.isArray(data) ? data : [];
+  const results = formularyResults(data);
   const counts = data?.counts ?? data?.source_counts ?? meta?.counts;
   const lines = [`Drug Formulary Evidence for "${query}": ${results.length} result${results.length === 1 ? "" : "s"}`];
   if (counts && typeof counts === "object") {
@@ -982,7 +1022,15 @@ function registerWorkflowTools(registerTool: RegisterVerityTool): void {
 Use this when a user asks whether codes are covered, whether prior authorization is required, what policies support the answer, or how coverage differs by jurisdiction.
 This tool can combine code lookup, related policy evidence, Medicare prior-auth checks, claim-risk validation, jurisdiction comparison, and spending evidence so the agent does not need to chain endpoint-shaped tools.`,
       inputSchema: {
-        procedure_codes: z.array(z.string()).min(1).max(10).describe("CPT/HCPCS procedure codes, e.g. ['76942'] or ['J0585', '64493']"),
+        procedure_codes: z.array(z.string()).min(1).max(50).describe("CPT/HCPCS procedure codes, e.g. ['76942'] or ['J0585', '64493']. Up to 50 are supported for code_details-only batch lookup; contextual modules are limited to 10 codes."),
+        code_system: z
+          .enum(["CPT", "HCPCS", "ICD10CM", "ICD10PCS", "NDC"])
+          .optional()
+          .describe("Optional code system hint for lookup, e.g. CPT or HCPCS"),
+        code_include: z
+          .array(z.enum(["rvu", "policies", "rates"]))
+          .default(["rvu", "policies"])
+          .describe("Code detail data to include when running code_details"),
         state: z.string().length(2).optional().describe("Two-letter patient state used to infer MAC jurisdiction, e.g. TX"),
         jurisdiction: z.string().max(10).optional().describe("Optional MAC jurisdiction code for policy filtering, e.g. JM or JH"),
         diagnosis_codes: z.array(z.string()).max(20).optional().describe("Diagnosis codes when claim-risk validation is needed"),
@@ -997,11 +1045,19 @@ This tool can combine code lookup, related policy evidence, Medicare prior-auth 
           .describe("Evidence modules to run. Defaults to code details and prior auth."),
       },
     },
-    async ({ procedure_codes, state, jurisdiction, diagnosis_codes, payer, plan_type, date_of_service, site_of_service, compare_jurisdictions, include }) => {
+    async ({ procedure_codes, code_system, code_include, state, jurisdiction, diagnosis_codes, payer, plan_type, date_of_service, site_of_service, compare_jurisdictions, include }) => {
       try {
         const requested = new Set(include as string[]);
+        const contextualModules = ["prior_auth", "claim_risk", "jurisdiction_compare", "spending"].filter((module) => requested.has(module));
+        if (procedure_codes.length > 10 && contextualModules.length > 0) {
+          return toolError(
+            `coverage_lookup supports up to 50 codes for code_details-only batch lookup. Limit procedure_codes to 10 when requesting ${contextualModules.join(", ")}.`,
+          );
+        }
+
         const data: Record<string, unknown> = {};
         const lines = [`Coverage Lookup for ${procedure_codes.join(", ")}`];
+        const normalizedCodeInclude = normalizeInclude(code_include, "rvu,policies");
 
         if (requested.has("code_details")) {
           const endpoint = procedure_codes.length === 1 ? "/codes/lookup" : "/codes/batch";
@@ -1011,14 +1067,19 @@ This tool can combine code lookup, related policy evidence, Medicare prior-auth 
               ? {
                   params: {
                     code: procedure_codes[0],
+                    code_system,
                     jurisdiction,
-                    include: "rvu,policies",
+                    include: normalizedCodeInclude,
                     fuzzy: "true",
                   },
                 }
               : {
                   method: "POST",
-                  body: { codes: procedure_codes, include: "rvu,policies" },
+                  body: {
+                    codes: procedure_codes,
+                    code_system,
+                    include: normalizedCodeInclude,
+                  },
                 },
           );
           data.code_details = result.data;
@@ -1029,7 +1090,7 @@ This tool can combine code lookup, related policy evidence, Medicare prior-auth 
         if (requested.has("prior_auth")) {
           const result = await verityRequest<any>("/prior-auth/check", {
             method: "POST",
-            body: { procedure_codes, state },
+            body: { procedure_codes, diagnosis_codes, payer, state },
           });
           data.prior_auth = result.data;
           lines.push("\n--- Prior Authorization ---");
@@ -1258,7 +1319,7 @@ Use this for policy search, fetching one policy by ID, searching extracted crite
         if (action === "check") {
           const result = await verityRequest<any>("/prior-auth/check", {
             method: "POST",
-            body: { procedure_codes, state: body.state },
+            body: { procedure_codes, diagnosis_codes: body.diagnosis_codes, payer: body.payer, state: body.state },
           });
           return toolResult(formatPriorAuth(result.data), result.data, result.meta);
         }
@@ -1286,7 +1347,30 @@ Use this for policy search, fetching one policy by ID, searching extracted crite
     },
     async ({ query, payer, limit }) => {
       try {
-        const result = await verityRequest<any>("/drugs/formulary", { params: { q: query, payer, limit } });
+        let result = await verityRequest<any>("/drugs/formulary", { params: { q: query, payer, limit } });
+        const fallbackQuery = formularyResults(result.data).length === 0 ? simplifyDrugQuery(query) : undefined;
+
+        if (fallbackQuery) {
+          const fallbackResult = await verityRequest<any>("/drugs/formulary", { params: { q: fallbackQuery, payer, limit } });
+          if (formularyResults(fallbackResult.data).length > 0) {
+            result = {
+              ...fallbackResult,
+              data: fallbackResult.data,
+              meta: {
+                ...fallbackResult.meta,
+                original_query: query,
+                fallback_query: fallbackQuery,
+              },
+            };
+            const message = [
+              `No formulary evidence matched "${query}" exactly; showing results for "${fallbackQuery}".`,
+              "",
+              formatDrugFormulary(fallbackResult.data, fallbackQuery, fallbackResult.meta),
+            ].join("\n");
+            return toolResult(message, result.data, result.meta);
+          }
+        }
+
         return toolResult(formatDrugFormulary(result.data, query, result.meta), result.data, result.meta);
       } catch (error) {
         return { content: [{ type: "text", text: formatToolError("search drug formulary", error) }] };
@@ -1316,7 +1400,7 @@ Use this for policy search, fetching one policy by ID, searching extracted crite
         }
         if (action === "list_unreviewed") {
           const result = await verityRequest<any>("/compliance/unreviewed", { params: { change_type, cursor, limit } });
-          return toolResult(formatJson({ data: result.data, meta: result.meta }), result.data, result.meta);
+          return toolResult(formatComplianceChanges(result.data, result.meta), result.data, result.meta);
         }
         if (action === "acknowledge") {
           if (diff_id === undefined) return toolError("diff_id is required when action='acknowledge'.");

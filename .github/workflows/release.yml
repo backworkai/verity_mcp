@@ -25,7 +25,7 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - run: npm ci
+      - run: npm run guard:release-tag
       - run: npm test
       - run: npm pack --dry-run
       - run: npm publish --provenance --access public
-
