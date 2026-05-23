@@ -1,10 +1,10 @@
 {
-  "name": "verity-mcp",
-  "version": "1.1.0",
+  "name": "@backwork/verity-mcp",
+  "version": "1.1.1",
   "description": "MCP server for Verity healthcare API - Medicare coverage policies, prior auth, and medical codes",
   "type": "module",
   "bin": {
-    "verity-mcp": "./build/src/index.js"
+    "verity-mcp": "build/src/index.js"
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('build', { recursive: true, force: true })\"",
