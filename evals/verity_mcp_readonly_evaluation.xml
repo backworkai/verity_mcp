@@ -1,0 +1,42 @@
+<evaluation>
+  <qa_pair>
+    <question>Use read-only Verity tools to find the MAC jurisdiction covering Texas, then use that jurisdiction when checking CPT 76942. What jurisdiction code covers Texas? Answer with the exact jurisdiction code only.</question>
+    <answer>JH</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Use read-only Verity tools to find the MAC jurisdiction covering California. What jurisdiction code covers California? Answer with the exact jurisdiction code only.</question>
+    <answer>JE</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Look up medical code 76942 with RVU and policy data, then identify its code system. Answer with the exact code system only.</question>
+    <answer>CPT</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Look up medical code J0585 with policy data, then identify its code system. Answer with the exact code system only.</question>
+    <answer>HCPCS</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Look up CPT 76942 with RVU data. What work RVU does Verity return? Answer with the numeric value only.</question>
+    <answer>0.65</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Look up CPT 76942 with related policies and find the returned LCD whose source URL contains lcdid=40381. What policy ID is returned for that LCD? Answer with the exact policy ID only.</question>
+    <answer>WPS-L40381</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Look up HCPCS J0585 with related policies and find the Noridian LCD titled Botulinum Toxin Injections for jurisdiction JF. What policy ID is returned? Answer with the exact policy ID only.</question>
+    <answer>NORIDIAN-L35172</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Retrieve policy L33831 with codes included. Which code system appears in the policy's associated codes? Answer with the exact code system only.</question>
+    <answer>HCPCS</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Retrieve policy L33831. What is its effective date? Answer in YYYY-MM-DD format only.</question>
+    <answer>2024-01-01</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Search active NCD policies for continuous glucose monitor and find the result titled Blood Glucose Testing. What policy ID is returned? Answer with the exact policy ID only.</question>
+    <answer>NCD98</answer>
+  </qa_pair>
+</evaluation>
