@@ -25,6 +25,39 @@ const allowedHosts = parseAllowedList(process.env.VERITY_MCP_ALLOWED_HOSTS || pr
 
 type AuthenticatedIncomingMessage = IncomingMessage & { auth?: AuthInfo };
 
+const includeSchema = z.union([z.string(), z.array(z.string())]).optional();
+
+class VerityApiError extends Error {
+  status: number;
+  code?: string;
+  hint?: string;
+  details?: unknown;
+  requestId?: string;
+  upgradeTo?: string;
+  requiredPlan?: string;
+
+  constructor(params: {
+    status: number;
+    message: string;
+    code?: string;
+    hint?: string;
+    details?: unknown;
+    requestId?: string;
+    upgradeTo?: string;
+    requiredPlan?: string;
+  }) {
+    super(params.message);
+    this.name = "VerityApiError";
+    this.status = params.status;
+    this.code = params.code;
+    this.hint = params.hint;
+    this.details = params.details;
+    this.requestId = params.requestId;
+    this.upgradeTo = params.upgradeTo;
+    this.requiredPlan = params.requiredPlan;
+  }
+}
+
 function readOption(name: string): string | undefined {
   const prefix = `--${name}=`;
   const inline = args.find((arg) => arg.startsWith(prefix));
@@ -178,20 +211,142 @@ async function verityRequest<T>(
   const data = text ? JSON.parse(text) : { success: true, data: null };
 
   if (!response.ok) {
-    const errorMsg = data.error?.message || `API error: ${response.status}`;
-    const hint = data.error?.hint || "";
-    throw new Error(hint ? `${errorMsg}. Hint: ${hint}` : errorMsg);
+    throw new VerityApiError({
+      status: response.status,
+      code: data.error?.code,
+      message: data.error?.message || `API error: ${response.status}`,
+      hint: data.error?.hint,
+      details: data.error?.details,
+      requestId: data.meta?.request_id,
+      upgradeTo: data.error?.upgrade_to,
+      requiredPlan: data.error?.required_plan,
+    });
   }
 
   return data as T;
 }
 
 // Format helpers for clean output
+function cleanText(value: unknown, max = 500): string {
+  const text = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, max).trimEnd()}...`;
+}
+
+function humanize(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "unknown";
+  return String(value);
+}
+
+function isTruthyRequirement(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (value === null || value === undefined) return false;
+  const text = String(value).trim().toLowerCase();
+  return Boolean(text) && !["-", "0", "false", "n", "no", "none", "not required", "not_required", "na", "n/a"].includes(text);
+}
+
+function formatCurrency(value: unknown): string | null {
+  const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isFinite(numeric)) return null;
+  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(numeric);
+}
+
+function formatNumber(value: unknown): string | null {
+  const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isFinite(numeric)) return null;
+  return new Intl.NumberFormat("en-US").format(numeric);
+}
+
+function asArray(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") return value.split(",").map((item) => item.trim()).filter(Boolean);
+  if (value && typeof value === "object") return Object.keys(value as Record<string, unknown>);
+  return [];
+}
+
+function normalizeInclude(value: string | string[] | undefined, fallback?: string): string | undefined {
+  if (Array.isArray(value)) return value.map((item) => item.trim()).filter(Boolean).join(",");
+  if (typeof value === "string" && value.trim()) return value.trim();
+  return fallback;
+}
+
+function truncateList<T>(items: T[] | undefined, limit: number): { shown: T[]; remaining: number; total: number } {
+  const safeItems = Array.isArray(items) ? items : [];
+  return {
+    shown: safeItems.slice(0, limit),
+    remaining: Math.max(0, safeItems.length - limit),
+    total: safeItems.length,
+  };
+}
+
+function dispositionCounts(policies: any[]): string {
+  const counts = new Map<string, number>();
+  for (const policy of policies) {
+    const dispositions = Array.isArray(policy.codes) && policy.codes.length > 0
+      ? policy.codes.map((code: any) => code.disposition)
+      : [policy.disposition];
+    for (const disposition of dispositions.filter(Boolean)) {
+      counts.set(disposition, (counts.get(disposition) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()].map(([name, count]) => `${name}: ${count}`).join(", ") || "no dispositions";
+}
+
+function formatToolError(action: string, error: unknown): string {
+  if (error instanceof VerityApiError) {
+    const details = error.details && typeof error.details === "object" ? (error.details as Record<string, unknown>) : {};
+    const requiredScopes = asArray(details.required_scopes).map(String);
+    const requiredPlan = details.required_plan || details.required_feature || error.requiredPlan || error.upgradeTo;
+
+    if (
+      error.status === 403 ||
+      error.code === "AUTHZ_SCOPE_REQUIRED" ||
+      error.code === "AUTH_SCOPE_INSUFFICIENT" ||
+      requiredPlan
+    ) {
+      const requirements = [
+        requiredScopes.length ? `scope ${requiredScopes.map((scope) => `"${scope}"`).join(" or ")}` : null,
+        requiredPlan ? `plan/feature "${requiredPlan}"` : null,
+      ].filter(Boolean);
+      return [
+        `Cannot ${action}: this API key is authenticated but is not authorized for that operation.`,
+        requirements.length ? `Required: ${requirements.join("; ")}.` : "Required: a higher-scope key or plan entitlement.",
+        "Use a key with the required scope/plan, upgrade the organization, or choose a read-only tool for this workflow.",
+        error.requestId ? `Request ID: ${error.requestId}` : null,
+      ].filter(Boolean).join("\n");
+    }
+
+    if (error.status === 401) {
+      return `Cannot ${action}: the API key was missing, invalid, revoked, or suspended.${error.requestId ? `\nRequest ID: ${error.requestId}` : ""}`;
+    }
+
+    return [
+      `Error ${action}: ${error.message}`,
+      error.hint ? `Hint: ${error.hint}` : null,
+      error.code ? `Code: ${error.code}` : null,
+      error.requestId ? `Request ID: ${error.requestId}` : null,
+    ].filter(Boolean).join("\n");
+  }
+
+  return `Error ${action}: ${error instanceof Error ? error.message : String(error)}`;
+}
+
 function formatCode(code: any): string {
   const lines: string[] = [];
   lines.push(`Code: ${code.code} (${code.code_system})`);
-  if (code.description) lines.push(`Description: ${code.description}`);
-  if (code.short_description) lines.push(`Short: ${code.short_description}`);
+  const description = code.description || code.long_description || code.short_description || code.display || code.name;
+  lines.push(
+    `Description: ${
+      description
+        ? cleanText(description, 300)
+        : code.code_system === "CPT"
+          ? "Omitted for CPT licensing; use the code, RVU fields, and source-backed policies below."
+          : "Not returned by API"
+    }`,
+  );
+  if (code.short_description && code.short_description !== description) lines.push(`Short: ${cleanText(code.short_description, 160)}`);
   if (code.category) lines.push(`Category: ${code.category}`);
   if (code.is_active !== undefined) lines.push(`Active: ${code.is_active ? "Yes" : "No"}`);
 
@@ -206,12 +361,17 @@ function formatCode(code: any): string {
   }
 
   if (code.policies && code.policies.length > 0) {
-    lines.push("\nRelated Policies:");
-    code.policies.forEach((p: any) => {
-      lines.push(`  - ${p.policy_id}: ${p.title}`);
-      lines.push(`    Type: ${p.policy_type}, Disposition: ${p.disposition}`);
+    const policies = code.policies as any[];
+    const { shown, remaining, total } = truncateList(policies, 8);
+    lines.push(`\nRelated Policies: ${total} found (${dispositionCounts(policies)})`);
+    lines.push("  Note: policy matches are code-list evidence and may include broader procedure families.");
+    shown.forEach((p: any) => {
+      lines.push(`  - ${p.policy_id}: ${cleanText(p.title, 140)}`);
+      lines.push(`    Type: ${p.policy_type || "unknown"}, Disposition: ${p.disposition || "unknown"}`);
       if (p.jurisdiction) lines.push(`    Jurisdiction: ${p.jurisdiction}`);
+      if (p.source_url) lines.push(`    Source: ${p.source_url}`);
     });
+    if (remaining > 0) lines.push(`  ... ${remaining} more policies omitted. Use search_policies or get_policy for focused evidence.`);
   }
 
   if (code.suggestions && code.suggestions.length > 0) {
@@ -227,15 +387,16 @@ function formatCode(code: any): string {
 
 function formatPolicy(policy: any, detailed = false): string {
   const lines: string[] = [];
-  lines.push(`Policy: ${policy.policy_id} - ${policy.title}`);
+  lines.push(`Policy: ${policy.policy_id} - ${cleanText(policy.title, 180)}`);
   lines.push(`Type: ${policy.policy_type} | Status: ${policy.status}`);
   if (policy.jurisdiction) lines.push(`Jurisdiction: ${policy.jurisdiction}`);
   if (policy.effective_date) lines.push(`Effective: ${policy.effective_date}`);
   if (policy.retire_date) lines.push(`Retired: ${policy.retire_date}`);
+  if (policy.source_url) lines.push(`Source: ${policy.source_url}`);
 
   if (detailed) {
-    if (policy.description) lines.push(`\nDescription: ${policy.description}`);
-    if (policy.summary) lines.push(`\nSummary: ${policy.summary}`);
+    if (policy.summary) lines.push(`\nSummary: ${cleanText(policy.summary, 700)}`);
+    else if (policy.description) lines.push(`\nDescription: ${cleanText(policy.description, 700)}`);
 
     if (policy.mac) {
       lines.push(`\nMAC: ${policy.mac.name} (${policy.mac.jurisdiction_name})`);
@@ -244,41 +405,41 @@ function formatPolicy(policy: any, detailed = false): string {
 
     if (policy.sections) {
       if (policy.sections.indications) {
-        lines.push(`\n--- Indications ---\n${policy.sections.indications.slice(0, 1000)}${policy.sections.indications.length > 1000 ? "..." : ""}`);
+        lines.push(`\n--- Indications ---\n${cleanText(policy.sections.indications, 700)}`);
       }
       if (policy.sections.limitations) {
-        lines.push(`\n--- Limitations ---\n${policy.sections.limitations.slice(0, 1000)}${policy.sections.limitations.length > 1000 ? "..." : ""}`);
+        lines.push(`\n--- Limitations ---\n${cleanText(policy.sections.limitations, 700)}`);
       }
       if (policy.sections.documentation) {
-        lines.push(`\n--- Documentation Requirements ---\n${policy.sections.documentation.slice(0, 1000)}${policy.sections.documentation.length > 1000 ? "..." : ""}`);
+        lines.push(`\n--- Documentation Requirements ---\n${cleanText(policy.sections.documentation, 700)}`);
       }
     }
 
     if (policy.criteria && Object.keys(policy.criteria).length > 0) {
       lines.push("\n--- Coverage Criteria ---");
       Object.entries(policy.criteria).forEach(([section, blocks]: [string, any]) => {
+        const criteriaBlocks = Array.isArray(blocks) ? blocks : [];
         lines.push(`\n[${section.toUpperCase()}]`);
-        blocks.slice(0, 3).forEach((block: any) => {
-          lines.push(`  - ${block.text.slice(0, 200)}${block.text.length > 200 ? "..." : ""}`);
+        criteriaBlocks.slice(0, 2).forEach((block: any) => {
+          lines.push(`  - ${cleanText(block.text, 240)}`);
           if (block.tags?.length) lines.push(`    Tags: ${block.tags.join(", ")}`);
         });
-        if (blocks.length > 3) lines.push(`  ... and ${blocks.length - 3} more criteria`);
+        if (criteriaBlocks.length > 2) lines.push(`  ... and ${criteriaBlocks.length - 2} more criteria`);
       });
     }
 
     if (policy.codes && Object.keys(policy.codes).length > 0) {
       lines.push("\n--- Associated Codes ---");
       Object.entries(policy.codes).forEach(([system, codes]: [string, any]) => {
-        lines.push(`\n[${system}] (${codes.length} codes)`);
-        codes.slice(0, 10).forEach((c: any) => {
+        const codeList = Array.isArray(codes) ? codes : [];
+        lines.push(`\n[${system}] (${codeList.length} codes)`);
+        codeList.slice(0, 8).forEach((c: any) => {
           lines.push(`  - ${c.code}: ${c.display || "No description"} [${c.disposition}]`);
         });
-        if (codes.length > 10) lines.push(`  ... and ${codes.length - 10} more codes`);
+        if (codeList.length > 8) lines.push(`  ... and ${codeList.length - 8} more codes`);
       });
     }
   }
-
-  if (policy.source_url) lines.push(`\nSource: ${policy.source_url}`);
 
   return lines.join("\n");
 }
@@ -299,25 +460,31 @@ function formatPriorAuth(result: any): string {
 
   // Matched policies
   if (result.matched_policies?.length > 0) {
-    lines.push("\n--- Matched Policies ---");
-    result.matched_policies.forEach((p: any) => {
+    const { shown, remaining, total } = truncateList(result.matched_policies, 6);
+    lines.push(`\n--- Matched Policies (${total}) ---`);
+    shown.forEach((p: any) => {
       lines.push(`\n${p.policy_id}: ${p.title}`);
       lines.push(`Type: ${p.policy_type}${p.jurisdiction ? ` | Jurisdiction: ${p.jurisdiction}` : ""}`);
+      if (p.source_url) lines.push(`Source: ${p.source_url}`);
       if (p.codes?.length > 0) {
         lines.push("Codes:");
-        p.codes.forEach((c: any) => {
+        p.codes.slice(0, 5).forEach((c: any) => {
           lines.push(`  - ${c.code} (${c.code_system}): ${c.disposition}`);
         });
+        if (p.codes.length > 5) lines.push(`  ... ${p.codes.length - 5} more codes omitted`);
       }
     });
+    if (remaining > 0) lines.push(`\n... ${remaining} more matched policies omitted. Use get_policy for full evidence.`);
   }
 
   // Documentation checklist
   if (result.documentation_checklist?.length > 0) {
+    const { shown, remaining } = truncateList(result.documentation_checklist, 8);
     lines.push("\n--- Documentation Checklist ---");
-    result.documentation_checklist.forEach((item: string, i: number) => {
-      lines.push(`${i + 1}. ${item}`);
+    shown.forEach((item, i) => {
+      lines.push(`${i + 1}. ${cleanText(item, 260)}`);
     });
+    if (remaining > 0) lines.push(`... ${remaining} more documentation items omitted`);
   }
 
   // Criteria details
@@ -326,7 +493,7 @@ function formatPriorAuth(result: any): string {
     if (cd.indications?.length > 0) {
       lines.push("\n--- Indications ---");
       cd.indications.slice(0, 5).forEach((ind: any) => {
-        lines.push(`- ${ind.text.slice(0, 200)}${ind.text.length > 200 ? "..." : ""}`);
+        lines.push(`- ${cleanText(ind.text, 220)}`);
       });
       if (cd.pagination?.indications?.total > 5) {
         lines.push(`... and ${cd.pagination.indications.total - 5} more indications`);
@@ -336,7 +503,7 @@ function formatPriorAuth(result: any): string {
     if (cd.limitations?.length > 0) {
       lines.push("\n--- Limitations ---");
       cd.limitations.slice(0, 5).forEach((lim: any) => {
-        lines.push(`- ${lim.text.slice(0, 200)}${lim.text.length > 200 ? "..." : ""}`);
+        lines.push(`- ${cleanText(lim.text, 220)}`);
       });
       if (cd.pagination?.limitations?.total > 5) {
         lines.push(`... and ${cd.pagination.limitations.total - 5} more limitations`);
@@ -349,6 +516,192 @@ function formatPriorAuth(result: any): string {
 
 function formatJson(value: unknown): string {
   return JSON.stringify(value, null, 2);
+}
+
+function formatBatchLookup(data: any): string {
+  const results = data?.results ?? data;
+  const entries = Array.isArray(results)
+    ? results.map((value: any) => [value.code ?? "unknown", value] as const)
+    : Object.entries(results ?? {});
+  const { shown, remaining, total } = truncateList(entries, 20);
+  const foundCount = entries.filter(([, value]: any) => value?.found !== false).length;
+  const lines = [`Batch Code Lookup: ${foundCount}/${total} resolved`];
+
+  for (const [requestedCode, value] of shown as Array<[string, any]>) {
+    if (!value || value.found === false) {
+      lines.push(`\n${requestedCode}: not found`);
+      continue;
+    }
+
+    const description = value.description || value.long_description || value.short_description || value.display;
+    lines.push(`\n${value.code ?? requestedCode} (${value.code_system ?? "unknown"})`);
+    lines.push(
+      `  Description: ${
+        description
+          ? cleanText(description, 220)
+          : value.code_system === "CPT"
+            ? "Omitted for CPT licensing"
+            : "Not returned by API"
+      }`,
+    );
+    if (value.rvu) {
+      const facility = formatCurrency(value.rvu.facility_price);
+      const nonFacility = formatCurrency(value.rvu.non_facility_price);
+      const rvuParts = [
+        value.rvu.work_rvu ? `work RVU ${value.rvu.work_rvu}` : null,
+        facility ? `facility ${facility}` : null,
+        nonFacility ? `non-facility ${nonFacility}` : null,
+      ].filter(Boolean);
+      if (rvuParts.length) lines.push(`  RVU: ${rvuParts.join(", ")}`);
+    }
+    const policies = Array.isArray(value.policies) ? value.policies : [];
+    if (policies.length) {
+      lines.push(`  Policies: ${policies.length} (${dispositionCounts(policies)})`);
+      policies.slice(0, 3).forEach((policy: any) => {
+        lines.push(`    - ${policy.policy_id}: ${cleanText(policy.title, 120)} [${policy.disposition ?? "unknown"}]`);
+      });
+      if (policies.length > 3) lines.push(`    ... ${policies.length - 3} more omitted`);
+    }
+  }
+
+  if (remaining > 0) lines.push(`\nShowing ${shown.length} of ${total} codes. Submit a smaller batch for full per-code detail.`);
+  return lines.join("\n");
+}
+
+function formatSpending(data: any): string {
+  const entries = Object.entries(data ?? {});
+  if (entries.length === 0) return "No spending records returned.";
+
+  const lines = ["Medicaid Spending by Code"];
+  for (const [code, record] of entries as Array<[string, any]>) {
+    lines.push(`\n${code}`);
+    const totalPaid = formatCurrency(record.total_paid);
+    const totalClaims = formatNumber(record.total_claims);
+    const beneficiaries = formatNumber(record.unique_beneficiaries ?? record.beneficiaries);
+    if (totalPaid) lines.push(`  Total paid: ${totalPaid}`);
+    if (totalClaims) lines.push(`  Claims: ${totalClaims}`);
+    if (beneficiaries) lines.push(`  Beneficiaries: ${beneficiaries}`);
+
+    const byYear = Array.isArray(record.by_year) ? record.by_year : [];
+    if (byYear.length) {
+      lines.push("  By year:");
+      byYear.slice(0, 5).forEach((year: any) => {
+        const yearPaid = formatCurrency(year.total_paid);
+        const yearClaims = formatNumber(year.total_claims);
+        lines.push(`    - ${year.year}: ${[yearPaid, yearClaims ? `${yearClaims} claims` : null].filter(Boolean).join(", ")}`);
+      });
+      if (byYear.length > 5) lines.push(`    ... ${byYear.length - 5} more years omitted`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatComplianceStats(data: any): string {
+  const total = data?.total_changes ?? data?.total_changes_30d ?? data?.total ?? data?.changes_total;
+  const acknowledged = data?.acknowledged_count ?? data?.acknowledged ?? data?.ack_count;
+  const rate = data?.acknowledgment_rate ?? data?.ack_rate;
+  const critical = data?.critical_unreviewed_count ?? data?.critical_unreviewed;
+  const unreviewed = data?.unreviewed_count ?? data?.unreviewed;
+  const lines = ["Compliance Statistics"];
+  if (total !== undefined) lines.push(`Total changes: ${humanize(total)}`);
+  if (acknowledged !== undefined) lines.push(`Acknowledged: ${humanize(acknowledged)}`);
+  if (unreviewed !== undefined) lines.push(`Unreviewed: ${humanize(unreviewed)}`);
+  if (rate !== undefined) {
+    const percent = typeof rate === "number" ? rate : null;
+    lines.push(`Acknowledgment rate: ${percent === null ? humanize(rate) : `${Math.round(percent)}%`}`);
+  }
+  if (critical !== undefined) lines.push(`Critical unreviewed: ${humanize(critical)}`);
+
+  const keysShown = new Set([
+    "total_changes",
+    "total_changes_30d",
+    "total",
+    "changes_total",
+    "acknowledged_count",
+    "acknowledged",
+    "ack_count",
+    "unreviewed_count",
+    "unreviewed",
+    "acknowledgment_rate",
+    "ack_rate",
+    "critical_unreviewed_count",
+    "critical_unreviewed",
+  ]);
+  const extra = Object.entries(data ?? {}).filter(([key]) => !keysShown.has(key));
+  if (extra.length) {
+    lines.push("\nOther fields:");
+    extra.slice(0, 8).forEach(([key, value]) => lines.push(`- ${key}: ${typeof value === "object" ? JSON.stringify(value) : humanize(value)}`));
+  }
+  return lines.join("\n");
+}
+
+function formatDrugFormulary(data: any, query: string, meta?: any): string {
+  const results = Array.isArray(data?.results) ? data.results : Array.isArray(data) ? data : [];
+  const counts = data?.counts ?? data?.source_counts ?? meta?.counts;
+  const lines = [`Drug Formulary Evidence for "${query}": ${results.length} result${results.length === 1 ? "" : "s"}`];
+  if (counts && typeof counts === "object") {
+    lines.push(`Source counts: ${Object.entries(counts).map(([source, count]) => `${source}: ${count}`).join(", ")}`);
+  }
+
+  results.slice(0, 10).forEach((record: any, index: number) => {
+    const payer = record.payer || record.source || record.source_name || record.reporting_entity || "unknown payer";
+    const drug = record.drug_name || record.name || record.brand_name || record.generic_name || record.ndc || "unknown drug";
+    const tier = record.tier ?? record.formulary_tier;
+    const status = record.coverage_status ?? record.status ?? record.covered;
+    const requirements = record.requirements && typeof record.requirements === "object" ? record.requirements : {};
+    const utilization = [
+      isTruthyRequirement(record.prior_authorization ?? record.priorAuth ?? requirements.prior_authorization) ? "PA" : null,
+      isTruthyRequirement(record.step_therapy ?? record.stepTherapy ?? requirements.step_therapy) ? "step therapy" : null,
+      isTruthyRequirement(record.quantity_limit ?? record.quantityLimit ?? requirements.quantity_limit)
+        ? "quantity limit"
+        : null,
+      isTruthyRequirement(record.specialty ?? requirements.specialty) ? "specialty" : null,
+    ].filter(Boolean);
+
+    lines.push(`\n${index + 1}. ${cleanText(drug, 140)} (${payer})`);
+    if (status !== undefined && status !== null) lines.push(`   Coverage: ${humanize(status)}`);
+    if (tier !== undefined && tier !== null) lines.push(`   Tier: ${humanize(tier)}`);
+    if (utilization.length) lines.push(`   Utilization management: ${utilization.join(", ")}`);
+    if (requirements.text) lines.push(`   Requirements: ${cleanText(requirements.text, 180)}`);
+    const alternatives = [...asArray(record.alternatives), ...asArray(record.preferred_alternatives)]
+      .map(String)
+      .filter((item) => item && item !== "-" && item.toLowerCase() !== "none");
+    if (alternatives.length) lines.push(`   Alternatives: ${alternatives.slice(0, 5).join(", ")}`);
+    if (record.source_url) lines.push(`   Source: ${record.source_url}`);
+  });
+
+  if (results.length > 10) lines.push(`\nShowing 10 of ${results.length}. Use a lower limit or payer filter for focused evidence.`);
+  return lines.join("\n");
+}
+
+function formatMutationResult(action: string, data: any): string {
+  const lines = [`${action} succeeded.`];
+  if (data?.id !== undefined) lines.push(`ID: ${data.id}`);
+  if (data?.status) lines.push(`Status: ${data.status}`);
+  if (data?.url) lines.push(`URL: ${data.url}`);
+  if (data?.secret) {
+    lines.push(`Secret: ${data.secret}`);
+    lines.push("Store this secret now; the API only returns webhook secrets on creation.");
+  }
+  if (data?.acknowledged !== undefined) lines.push(`Acknowledged: ${data.acknowledged}`);
+  if (data?.acknowledged_count !== undefined) lines.push(`Acknowledged count: ${data.acknowledged_count}`);
+  if (data?.delivery?.status || data?.delivery_status) lines.push(`Delivery status: ${data.delivery?.status ?? data.delivery_status}`);
+  if (Object.keys(data ?? {}).length === 0) lines.push("No additional data returned.");
+  return lines.join("\n");
+}
+
+function formatWebhookList(data: any): string {
+  const endpoints = Array.isArray(data) ? data : [];
+  if (endpoints.length === 0) return "No webhook endpoints are configured for this organization.";
+  const lines = [`Webhook Endpoints: ${endpoints.length}`];
+  endpoints.slice(0, 20).forEach((endpoint: any) => {
+    lines.push(`\n${endpoint.id}: ${endpoint.url}`);
+    lines.push(`  Status: ${endpoint.status ?? "unknown"} | Events: ${(endpoint.events ?? []).join(", ") || "none"}`);
+    if (endpoint.failure_count !== undefined) lines.push(`  Failure count: ${endpoint.failure_count}`);
+    if (endpoint.created_at) lines.push(`  Created: ${endpoint.created_at}`);
+  });
+  if (endpoints.length > 20) lines.push(`\nShowing 20 of ${endpoints.length} endpoints.`);
+  return lines.join("\n");
 }
 
 function formatClaimValidation(result: any): string {
@@ -449,7 +802,7 @@ Examples:
         .optional()
         .describe("Code system hint - auto-detected if not provided"),
       jurisdiction: z.string().max(10).optional().describe("MAC jurisdiction code to filter policies (e.g., JM, JH)"),
-      include: z.string().optional().describe("Additional data: 'rvu', 'policies', or 'rvu,policies'"),
+      include: includeSchema.describe("Additional data as an array or comma string, e.g. ['rvu', 'policies']"),
       fuzzy: z.boolean().default(true).describe("Enable fuzzy matching for typos/partial codes"),
     },
   },
@@ -460,7 +813,7 @@ Examples:
           code,
           code_system,
           jurisdiction,
-          include: include || "rvu,policies",
+          include: normalizeInclude(include, "rvu,policies"),
           fuzzy: fuzzy ? "true" : "false",
         },
       });
@@ -481,7 +834,7 @@ Examples:
       };
     } catch (error) {
       return {
-        content: [{ type: "text", text: `Error looking up code: ${error instanceof Error ? error.message : String(error)}` }],
+        content: [{ type: "text", text: formatToolError("look up code", error) }],
       };
     }
   }
@@ -557,7 +910,7 @@ Examples:
       };
     } catch (error) {
       return {
-        content: [{ type: "text", text: `Error searching policies: ${error instanceof Error ? error.message : String(error)}` }],
+        content: [{ type: "text", text: formatToolError("search policies", error) }],
       };
     }
   }
@@ -576,13 +929,13 @@ Examples:
 - get_policy("A52458", { include: "criteria,codes" }) - with coverage criteria`,
     inputSchema: {
       policy_id: z.string().min(1).describe("Policy ID (e.g., L33831, A52458, NCD220.6)"),
-      include: z.string().optional().describe("Additional data: 'criteria', 'codes', 'attachments', 'versions'"),
+      include: includeSchema.describe("Additional data as an array or comma string, e.g. ['criteria', 'codes']"),
     },
   },
   async ({ policy_id, include }) => {
     try {
       const result = await verityRequest<any>(`/policies/${encodeURIComponent(policy_id)}`, {
-        params: { include },
+        params: { include: normalizeInclude(include) },
       });
 
       return {
@@ -590,7 +943,7 @@ Examples:
       };
     } catch (error) {
       return {
-        content: [{ type: "text", text: `Error getting policy: ${error instanceof Error ? error.message : String(error)}` }],
+        content: [{ type: "text", text: formatToolError("get policy", error) }],
       };
     }
   }
@@ -632,23 +985,34 @@ Examples:
       const summary = result.data.summary;
 
       lines.push(`Coverage Comparison for: ${summary.queried_codes.join(", ")}`);
+      if (summary.requested_jurisdictions?.length) {
+        lines.push(`Requested jurisdictions: ${summary.requested_jurisdictions.join(", ")}`);
+      }
       lines.push(`Jurisdictions analyzed: ${summary.total_jurisdictions}`);
       lines.push(`With coverage: ${summary.jurisdictions_with_coverage}`);
       lines.push(`National policies: ${summary.national_policies_count}`);
       lines.push(`Regional variation: ${summary.has_variation ? "YES" : "NO"}`);
+      if (summary.unresolved_jurisdictions?.length) {
+        lines.push(`Unresolved jurisdictions: ${summary.unresolved_jurisdictions.join(", ")}`);
+      }
 
       // National policies
       if (result.data.national_policies?.length > 0) {
         lines.push("\n--- NATIONAL POLICIES ---");
-        result.data.national_policies.forEach((p: any) => {
+        result.data.national_policies.slice(0, 5).forEach((p: any) => {
           lines.push(`\n${p.policy_id}: ${p.title}`);
           lines.push(`Type: ${p.policy_type}`);
+          if (p.source_url) lines.push(`Source: ${p.source_url}`);
           if (p.codes?.length > 0) {
-            p.codes.forEach((c: any) => {
+            p.codes.slice(0, 5).forEach((c: any) => {
               lines.push(`  - ${c.code}: ${c.disposition}`);
             });
+            if (p.codes.length > 5) lines.push(`  ... ${p.codes.length - 5} more codes omitted`);
           }
         });
+        if (result.data.national_policies.length > 5) {
+          lines.push(`\n... ${result.data.national_policies.length - 5} more national policies omitted`);
+        }
       }
 
       // Jurisdiction comparison
@@ -664,9 +1028,11 @@ Examples:
           }
 
           if (jur.policies?.length > 0) {
-            jur.policies.forEach((p: any) => {
+            jur.policies.slice(0, 5).forEach((p: any) => {
               lines.push(`  ${p.policy_id}: ${p.title}`);
+              if (p.source_url) lines.push(`    Source: ${p.source_url}`);
             });
+            if (jur.policies.length > 5) lines.push(`  ... ${jur.policies.length - 5} more policies omitted`);
           } else {
             lines.push("  No local policies found");
           }
@@ -678,7 +1044,7 @@ Examples:
       };
     } catch (error) {
       return {
-        content: [{ type: "text", text: `Error comparing policies: ${error instanceof Error ? error.message : String(error)}` }],
+        content: [{ type: "text", text: formatToolError("compare policies", error) }],
       };
     }
   }
@@ -725,9 +1091,12 @@ Examples:
         lines.push(`[${change.change_type.toUpperCase()}] ${change.policy_id}: ${change.policy_title}`);
         if (change.changed_at) lines.push(`  Date: ${change.changed_at}`);
         if (change.change_summary) lines.push(`  Summary: ${change.change_summary}`);
-        if (change.details?.changed_fields) lines.push(`  Fields: ${change.details.changed_fields.join(", ")}`);
-        if (change.details?.added_codes?.length) lines.push(`  Added codes: ${change.details.added_codes.join(", ")}`);
-        if (change.details?.removed_codes?.length) lines.push(`  Removed codes: ${change.details.removed_codes.join(", ")}`);
+        const changedFields = asArray(change.details?.changed_fields).map(String);
+        const addedCodes = asArray(change.details?.added_codes).map(String);
+        const removedCodes = asArray(change.details?.removed_codes).map(String);
+        if (changedFields.length) lines.push(`  Fields: ${changedFields.join(", ")}`);
+        if (addedCodes.length) lines.push(`  Added codes: ${addedCodes.join(", ")}`);
+        if (removedCodes.length) lines.push(`  Removed codes: ${removedCodes.join(", ")}`);
         lines.push("");
       });
 
@@ -740,7 +1109,7 @@ Examples:
       };
     } catch (error) {
       return {
-        content: [{ type: "text", text: `Error getting policy changes: ${error instanceof Error ? error.message : String(error)}` }],
+        content: [{ type: "text", text: formatToolError("get policy changes", error) }],
       };
     }
   }
@@ -812,7 +1181,7 @@ Examples:
       };
     } catch (error) {
       return {
-        content: [{ type: "text", text: `Error searching criteria: ${error instanceof Error ? error.message : String(error)}` }],
+        content: [{ type: "text", text: formatToolError("search criteria", error) }],
       };
     }
   }
@@ -850,7 +1219,7 @@ Example:
       };
     } catch (error) {
       return {
-        content: [{ type: "text", text: `Error listing jurisdictions: ${error instanceof Error ? error.message : String(error)}` }],
+        content: [{ type: "text", text: formatToolError("list jurisdictions", error) }],
       };
     }
   }
@@ -893,7 +1262,7 @@ Examples:
       };
     } catch (error) {
       return {
-        content: [{ type: "text", text: `Error checking prior auth: ${error instanceof Error ? error.message : String(error)}` }],
+        content: [{ type: "text", text: formatToolError("check prior auth", error) }],
       };
     }
   }
@@ -911,7 +1280,7 @@ server.registerTool(
       const result = await verityRequest<any>("/health");
       return { content: [{ type: "text", text: formatJson(result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error checking health: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("check health", error) }] };
     }
   }
 );
@@ -943,9 +1312,9 @@ server.registerTool(
       const result = await verityRequest<any>("/spending/by-code", {
         params: { code, codes: codes?.join(","), year },
       });
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      return { content: [{ type: "text", text: formatSpending(result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error getting spending data: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("get spending data", error) }] };
     }
   }
 );
@@ -984,7 +1353,7 @@ server.registerTool(
       });
       return { content: [{ type: "text", text: formatClaimValidation(result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error validating claim: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("validate claim", error) }] };
     }
   }
 );
@@ -1008,7 +1377,7 @@ server.registerTool(
       const result = await verityRequest<any>("/prior-auth/research", { method: "POST", body });
       return { content: [{ type: "text", text: formatResearch(result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error researching prior auth: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("research prior auth", error) }] };
     }
   }
 );
@@ -1027,7 +1396,7 @@ server.registerTool(
       const result = await verityRequest<any>(`/prior-auth/research/${encodeURIComponent(research_id)}`);
       return { content: [{ type: "text", text: formatResearch(result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error getting research status: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("get research status", error) }] };
     }
   }
 );
@@ -1040,15 +1409,18 @@ server.registerTool(
     inputSchema: {
       codes: z.array(z.string()).min(1).max(50),
       code_system: z.enum(["CPT", "HCPCS", "ICD10CM", "ICD10PCS", "NDC"]).optional(),
-      include: z.string().optional().describe("Comma-separated includes, e.g. rvu,policies"),
+      include: includeSchema.describe("Includes as an array or comma string, e.g. ['rvu', 'policies']"),
     },
   },
   async (body) => {
     try {
-      const result = await verityRequest<any>("/codes/batch", { method: "POST", body });
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      const result = await verityRequest<any>("/codes/batch", {
+        method: "POST",
+        body: { ...body, include: normalizeInclude(body.include) },
+      });
+      return { content: [{ type: "text", text: formatBatchLookup(result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error batch looking up codes: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("batch look up codes", error) }] };
     }
   }
 );
@@ -1068,7 +1440,7 @@ server.registerTool(
       const result = await verityRequest<any>("/coverage/evaluate", { method: "POST", body });
       return { content: [{ type: "text", text: formatJson(result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error evaluating coverage: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("evaluate coverage", error) }] };
     }
   }
 );
@@ -1083,9 +1455,9 @@ server.registerTool(
   async () => {
     try {
       const result = await verityRequest<any>("/webhooks");
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      return { content: [{ type: "text", text: formatWebhookList(result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error listing webhooks: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("list webhooks", error) }] };
     }
   }
 );
@@ -1103,9 +1475,9 @@ server.registerTool(
   async (body) => {
     try {
       const result = await verityRequest<any>("/webhooks", { method: "POST", body });
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      return { content: [{ type: "text", text: formatMutationResult("Create webhook", result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error creating webhook: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("create webhook", error) }] };
     }
   }
 );
@@ -1128,9 +1500,9 @@ server.registerTool(
         method: "PATCH",
         body: { url, events, status },
       });
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      return { content: [{ type: "text", text: formatMutationResult("Update webhook", result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error updating webhook: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("update webhook", error) }] };
     }
   }
 );
@@ -1147,9 +1519,9 @@ server.registerTool(
   async ({ id }) => {
     try {
       const result = await verityRequest<any>(`/webhooks/${id}`, { method: "DELETE" });
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      return { content: [{ type: "text", text: formatMutationResult("Delete webhook", result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error deleting webhook: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("delete webhook", error) }] };
     }
   }
 );
@@ -1166,9 +1538,9 @@ server.registerTool(
   async ({ id }) => {
     try {
       const result = await verityRequest<any>(`/webhooks/${id}/test`, { method: "POST" });
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      return { content: [{ type: "text", text: formatMutationResult("Test webhook", result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error testing webhook: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("test webhook", error) }] };
     }
   }
 );
@@ -1191,7 +1563,7 @@ server.registerTool(
       });
       return { content: [{ type: "text", text: formatJson({ data: result.data, meta: result.meta }) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error listing unreviewed changes: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("list unreviewed changes", error) }] };
     }
   }
 );
@@ -1209,9 +1581,9 @@ server.registerTool(
   async (body) => {
     try {
       const result = await verityRequest<any>("/compliance/ack", { method: "POST", body });
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      return { content: [{ type: "text", text: formatMutationResult("Acknowledge policy change", result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error acknowledging change: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("acknowledge change", error) }] };
     }
   }
 );
@@ -1229,9 +1601,9 @@ server.registerTool(
   async (body) => {
     try {
       const result = await verityRequest<any>("/compliance/ack/bulk", { method: "POST", body });
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      return { content: [{ type: "text", text: formatMutationResult("Bulk acknowledge policy changes", result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error bulk acknowledging changes: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("bulk acknowledge changes", error) }] };
     }
   }
 );
@@ -1246,9 +1618,9 @@ server.registerTool(
   async () => {
     try {
       const result = await verityRequest<any>("/compliance/stats");
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      return { content: [{ type: "text", text: formatComplianceStats(result.data) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error getting compliance stats: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("get compliance stats", error) }] };
     }
   }
 );
@@ -1269,9 +1641,9 @@ server.registerTool(
       const result = await verityRequest<any>("/drugs/formulary", {
         params: { q: query, payer, limit },
       });
-      return { content: [{ type: "text", text: formatJson(result.data) }] };
+      return { content: [{ type: "text", text: formatDrugFormulary(result.data, query, result.meta) }] };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error searching drug formulary: ${error instanceof Error ? error.message : String(error)}` }] };
+      return { content: [{ type: "text", text: formatToolError("search drug formulary", error) }] };
     }
   }
 );
