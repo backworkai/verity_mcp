@@ -42,7 +42,7 @@ Claude stores HTTP headers in its MCP config. Use a scoped Verity key and rotate
 For local stdio:
 
 ```bash
-claude mcp add -e VERITY_API_KEY=vrt_live_YOUR_API_KEY verity -- npx -y github:backworkai/verity_mcp
+claude mcp add verity -e VERITY_API_KEY=vrt_live_YOUR_API_KEY -- npx -y github:backworkai/verity_mcp
 ```
 
 ## Cursor, VS Code, Windsurf, and Other MCP Clients
