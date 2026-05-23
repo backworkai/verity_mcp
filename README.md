@@ -2,59 +2,60 @@
 
 Official Model Context Protocol (MCP) server for the [Verity API](https://verity.backworkai.com). It gives AI assistants controlled access to Medicare coverage policies, medical code intelligence, prior authorization checks, claim validation, compliance review, drug formulary evidence, and webhook operations.
 
-## What It Provides
+## Current Setup
 
-- Medical code lookup for CPT, HCPCS, ICD-10, and NDC codes
-- Policy search, retrieval, change tracking, and jurisdiction comparison
-- Prior authorization checks and payer website research
-- Claim coverage and denial risk validation
-- Coverage criteria search and policy evaluation
-- Medicaid spending data by HCPCS code
-- Compliance review and acknowledgment workflows
-- Drug formulary evidence across supported PBM sources
-- Webhook management tools for enterprise integrations
-
-## Installation
-
-```bash
-git clone https://github.com/backworkai/verity_mcp.git
-cd verity_mcp
-npm install
-npm run build
-```
-
-Requires Node.js 18 or newer.
-
-## Configuration
-
-Set a Verity API key in the MCP server environment:
+The current stable setup is local stdio via `npx`:
 
 ```bash
 export VERITY_API_KEY=vrt_live_YOUR_API_KEY
 ```
 
-Optional:
+Then add the server to your MCP client using the client-specific examples below.
+
+Remote Streamable HTTP support is implemented in this server for self-hosting and future hosted deployment. A public Verity-hosted MCP endpoint is not live yet, so do not use `https://<your-verity-mcp-host>/mcp` until Verity publishes one.
+
+## Codex
+
+Codex supports Streamable HTTP MCP servers and can source the bearer token from an environment variable:
 
 ```bash
-export VERITY_API_BASE=https://verity.backworkai.com/api/v1
+export VERITY_API_KEY=vrt_live_YOUR_API_KEY
+codex mcp add verity -- npx -y github:backworkai/verity_mcp
 ```
 
-Get an API key from the [Verity dashboard](https://verity.backworkai.com/dashboard).
+For a self-hosted Streamable HTTP server:
 
-### Claude Desktop
+```bash
+export VERITY_API_KEY=vrt_live_YOUR_API_KEY
+codex mcp add verity --url https://<your-verity-mcp-host>/mcp --bearer-token-env-var VERITY_API_KEY
+```
 
-Add the server to your Claude Desktop configuration.
+## Claude Code
 
-macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+For local stdio:
 
-Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+```bash
+export VERITY_API_KEY=vrt_live_YOUR_API_KEY
+claude mcp add verity -- npx -y github:backworkai/verity_mcp
+```
+
+For a self-hosted Streamable HTTP server:
+
+```bash
+export VERITY_API_KEY=vrt_live_YOUR_API_KEY
+claude mcp add --transport http verity https://<your-verity-mcp-host>/mcp --header "Authorization: Bearer $VERITY_API_KEY"
+```
+
+## Cursor, VS Code, Windsurf, and Other MCP Clients
+
+For clients that only support stdio commands:
 
 ```json
 {
   "mcpServers": {
     "verity": {
-      "command": "node",
-      "args": ["/absolute/path/to/verity_mcp/build/index.js"],
+      "command": "npx",
+      "args": ["-y", "github:backworkai/verity_mcp"],
       "env": {
         "VERITY_API_KEY": "vrt_live_YOUR_API_KEY"
       }
@@ -63,17 +64,72 @@ Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 }
 ```
 
-### Claude Code
+For clients that support remote URLs and headers against a self-hosted server:
 
-```bash
-claude mcp add verity node /absolute/path/to/verity_mcp/build/index.js
+```json
+{
+  "mcpServers": {
+    "verity": {
+      "url": "https://<your-verity-mcp-host>/mcp",
+      "headers": {
+        "Authorization": "Bearer ${VERITY_API_KEY}"
+      }
+    }
+  }
+}
 ```
 
-### Codex
+## Self-Hosting
+
+Run a Streamable HTTP server:
 
 ```bash
-codex mcp add verity --env VERITY_API_KEY=vrt_live_YOUR_API_KEY -- node /absolute/path/to/verity_mcp/build/index.js
+git clone https://github.com/backworkai/verity_mcp.git
+cd verity_mcp
+npm install
+npm run build
+npm run start:http
 ```
+
+Defaults:
+
+| Setting | Default | Override |
+| --- | --- | --- |
+| Transport | `stdio` | `--http` or `VERITY_MCP_TRANSPORT=http` |
+| Host | `127.0.0.1` | `--host` or `VERITY_MCP_HOST` |
+| Port | `3000` | `--port` or `VERITY_MCP_PORT` or `PORT` |
+| MCP path | `/mcp` | `--path` or `VERITY_MCP_PATH` |
+
+HTTP mode requires `Authorization: Bearer <Verity API key>` per request by default. For a private single-tenant deployment where the server environment supplies the key, set:
+
+```bash
+VERITY_MCP_ALLOW_ENV_KEY=true VERITY_API_KEY=vrt_live_YOUR_API_KEY npm run start:http
+```
+
+Only use `VERITY_MCP_ALLOW_ENV_KEY=true` on loopback or private-network deployments protected by network access control. Public deployments should require a bearer token per request and set `VERITY_MCP_ALLOWED_ORIGINS` to the exact client origins that may connect.
+
+Health check:
+
+```bash
+curl http://localhost:3000/health
+```
+
+## Local Development
+
+```bash
+npm install
+npm run build
+VERITY_API_KEY=vrt_live_YOUR_API_KEY npm start
+```
+
+Useful commands:
+
+```bash
+npm run start:http
+node build/index.js --help
+```
+
+Requires Node.js 18 or newer.
 
 ## Available Tools
 
@@ -123,23 +179,29 @@ Validate denial risk for 99213 with diagnosis E11.9 for Medicare in Texas.
 Search formulary evidence for Ozempic across commercial PBMs.
 ```
 
-## Development
+## Environment Variables
 
-```bash
-npm install
-npm run build
-npm start
-```
+| Variable | Required | Description |
+| --- | --- | --- |
+| `VERITY_API_KEY` | Stdio yes; HTTP no | Verity API key. In HTTP mode, prefer `Authorization: Bearer` per request. |
+| `VERITY_API_BASE` | No | Override the API base URL. |
+| `VERITY_MCP_TRANSPORT` | No | `stdio` or `http`. |
+| `VERITY_MCP_HOST` | No | HTTP bind host. Defaults to `127.0.0.1`. |
+| `VERITY_MCP_PORT` | No | HTTP bind port. |
+| `VERITY_MCP_PATH` | No | HTTP MCP path. |
+| `VERITY_MCP_ALLOWED_ORIGINS` | No | Comma-separated allowed HTTP origins. Loopback origins are allowed for loopback requests. |
+| `VERITY_MCP_ALLOW_ORIGIN` | No | Backward-compatible alias for `VERITY_MCP_ALLOWED_ORIGINS`. |
+| `VERITY_MCP_ALLOW_ENV_KEY` | No | Allow private HTTP requests without bearer auth to use `VERITY_API_KEY`. |
 
 ## Troubleshooting
 
 ### Missing API Key
 
-Set `VERITY_API_KEY` in the MCP client configuration or shell environment.
+For stdio, set `VERITY_API_KEY` in the MCP client configuration. For HTTP, send `Authorization: Bearer <key>`.
 
-### Authentication Errors
+### 401 From HTTP MCP
 
-Confirm the key is active and starts with `vrt_live_` or `vrt_test_`.
+The remote server did not receive a bearer token. Configure your MCP client to send an `Authorization` header or use a client option such as Codex `--bearer-token-env-var`.
 
 ### Rate Limits
 
