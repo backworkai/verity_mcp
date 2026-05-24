@@ -4,7 +4,16 @@ Official Model Context Protocol (MCP) server for the [Verity API](https://verity
 
 ## Current Setup
 
-The fastest setup is the hosted Streamable HTTP MCP endpoint:
+For Claude Code, use the hosted Streamable HTTP MCP endpoint with OAuth. This does not require copying a Verity API key into Claude Code:
+
+```bash
+claude mcp remove verity 2>/dev/null || true
+claude mcp add --transport http --scope user verity https://mcp.verity.backworkai.com/mcp
+```
+
+Then start Claude Code, run `/mcp`, select `verity`, complete the browser login, and approve the Verity consent screen.
+
+Codex currently uses the same hosted endpoint with a Verity API key:
 
 ```bash
 export VERITY_API_KEY=vrt_live_YOUR_API_KEY
@@ -30,7 +39,36 @@ codex mcp add verity --env VERITY_API_KEY=vrt_live_YOUR_API_KEY -- npx -y @backw
 
 ## Claude Code
 
-For hosted Streamable HTTP:
+For hosted Streamable HTTP, use OAuth:
+
+```bash
+claude mcp remove verity 2>/dev/null || true
+claude mcp add --transport http --scope user verity https://mcp.verity.backworkai.com/mcp
+```
+
+Then run `claude`, open `/mcp`, and authenticate `verity`. Claude Code discovers the OAuth protected-resource metadata, opens your browser, sends you through Verity login, and stores the OAuth token after you approve the consent screen.
+
+Verify the server is configured:
+
+```bash
+claude mcp list
+claude mcp get verity
+```
+
+If OAuth discovery needs to be pinned explicitly, add the same server as JSON:
+
+```bash
+claude mcp remove verity 2>/dev/null || true
+claude mcp add-json verity '{
+  "type": "http",
+  "url": "https://mcp.verity.backworkai.com/mcp",
+  "oauth": {
+    "scopes": "verity:mcp read"
+  }
+}'
+```
+
+For older clients or API-key fallback:
 
 ```bash
 export VERITY_API_KEY=vrt_live_YOUR_API_KEY
@@ -104,8 +142,8 @@ HTTP mode requires `Authorization: Bearer` per request. By default this bearer i
 
 ```bash
 VERITY_MCP_AUTH_MODE=oauth \
-VERITY_MCP_OAUTH_AUTHORIZATION_SERVERS=https://auth.example.com \
-VERITY_MCP_OAUTH_SCOPES=verity:mcp \
+VERITY_MCP_OAUTH_AUTHORIZATION_SERVERS=https://verity.backworkai.com \
+VERITY_MCP_OAUTH_SCOPES="verity:mcp read" \
 npm run start:http
 ```
 
@@ -124,9 +162,16 @@ Only use `VERITY_MCP_ALLOW_ENV_KEY=true` on loopback or private-network deployme
 This repo can deploy as an API-only Vercel project. The production project uses:
 
 ```bash
+VERITY_MCP_AUTH_MODE=oauth
 VERITY_MCP_PUBLIC_HOST=mcp.verity.backworkai.com
 VERITY_MCP_PUBLIC_URL=https://mcp.verity.backworkai.com
 VERITY_MCP_ALLOWED_HOSTS=mcp.verity.backworkai.com,verity-mcp.vercel.app
+VERITY_MCP_OAUTH_AUTHORIZATION_SERVERS=https://verity.backworkai.com
+VERITY_MCP_OAUTH_RESOURCE=https://mcp.verity.backworkai.com/mcp
+VERITY_MCP_OAUTH_SCOPES="verity:mcp read"
+VERITY_MCP_OAUTH_REQUIRED_SCOPES=verity:mcp
+VERITY_MCP_OAUTH_INTROSPECTION_URL=https://verity.backworkai.com/api/oauth/introspect
+VERITY_MCP_OAUTH_EXPECTED_AUDIENCE=https://mcp.verity.backworkai.com/mcp
 ```
 
 The Vercel functions expose:
@@ -137,6 +182,16 @@ The Vercel functions expose:
 | `/health` | Lightweight MCP server health check |
 | `/.well-known/oauth-protected-resource` | OAuth protected-resource metadata when OAuth is configured |
 | `/` | Basic endpoint metadata |
+
+The Verity web app that issues OAuth tokens must also be configured:
+
+```bash
+VERITY_OAUTH_ISSUER=https://verity.backworkai.com
+VERITY_OAUTH_SIGNING_SECRET=<generate with: openssl rand -base64 48>
+VERITY_MCP_RESOURCE=https://mcp.verity.backworkai.com/mcp
+```
+
+Production OAuth discovery fails closed unless `VERITY_OAUTH_SIGNING_SECRET` is at least 32 characters and Redis or Vercel KV is configured for one-time consent and authorization-code storage.
 
 Health check:
 
@@ -269,6 +324,27 @@ For stdio, set `VERITY_API_KEY` in the MCP client configuration. For HTTP API-ke
 ### 401 From HTTP MCP
 
 The remote server did not receive a bearer token. Configure your MCP client to authenticate with OAuth or send an `Authorization` header. OAuth-enabled deployments include `resource_metadata` in the `WWW-Authenticate` header to point clients at `/.well-known/oauth-protected-resource`.
+
+### Claude Code OAuth
+
+If Claude Code does not open the browser, run `/mcp`, select `verity`, and choose the authenticate action. If it gives you a URL instead of opening a browser, copy that URL into your browser.
+
+If the browser redirect back to Claude Code fails after consent, copy the full callback URL from the browser address bar and paste it into the Claude Code prompt.
+
+If Claude Code keeps using an old token, open `/mcp`, select `verity`, clear authentication, then authenticate again. You can also remove and re-add the server with:
+
+```bash
+claude mcp remove verity
+claude mcp add --transport http --scope user verity https://mcp.verity.backworkai.com/mcp
+```
+
+If discovery returns `503`, the Verity web app is intentionally refusing to advertise OAuth because production signing or Redis/KV state storage is missing.
+
+If tool calls authenticate but fail with `invalid_token` or `invalid_target`, check that `VERITY_MCP_RESOURCE`, `VERITY_MCP_OAUTH_RESOURCE`, and `VERITY_MCP_OAUTH_EXPECTED_AUDIENCE` all use:
+
+```text
+https://mcp.verity.backworkai.com/mcp
+```
 
 ### Rate Limits
 
