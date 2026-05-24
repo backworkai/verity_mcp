@@ -14,6 +14,7 @@ import { z } from "zod";
 // Configuration
 const VERITY_API_BASE = process.env.VERITY_API_BASE || "https://verity.backworkai.com/api/v1";
 const requestApiKey = new AsyncLocalStorage<string | undefined>();
+const requestToolName = new AsyncLocalStorage<string | undefined>();
 const args = process.argv.slice(2);
 const shouldShowHelp = args.includes("--help") || args.includes("-h");
 const transportMode = (readOption("transport") || process.env.VERITY_MCP_TRANSPORT || (args.includes("--http") ? "http" : "stdio")).toLowerCase();
@@ -347,8 +348,13 @@ async function verityRequest<T>(
     Authorization: `Bearer ${resolveVerityApiKey()}`,
     "Content-Type": "application/json",
     Accept: "application/json",
+    "X-Verity-Client": "mcp",
     ...extraHeaders,
   };
+  const toolName = requestToolName.getStore();
+  if (toolName && !headers["X-Verity-MCP-Tool"]) {
+    headers["X-Verity-MCP-Tool"] = `verity_${toolName}`;
+  }
 
   const response = await fetch(url.toString(), {
     method,
@@ -801,7 +807,8 @@ function wrapToolHandler(name: string, handler: VerityToolHandler): VerityToolHa
     const { handlerArgs, responseFormat } = splitResponseFormat(args);
 
     try {
-      return normalizeToolResult(await handler(handlerArgs, extra), responseFormat);
+      const result = await requestToolName.run(name, () => handler(handlerArgs, extra));
+      return normalizeToolResult(result, responseFormat);
     } catch (error) {
       return errorResult(`Error running ${name}: ${error instanceof Error ? error.message : String(error)}`);
     }
